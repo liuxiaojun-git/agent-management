@@ -1,5 +1,19 @@
 [
   {
+    "time": "2026/06/25 13:48:27",
+    "level": "info",
+    "source": "API 测试",
+    "message": "POST https://qingzhou-dev.heyshare.cn/api/v1/agent/summary/generate → 200",
+    "detail": "耗时 59.54s · 大小 5.0 KB",
+    "status": "success",
+    "duration": "59.54s",
+    "api": "/api/v1/agent/summary/generate",
+    "model": "",
+    "category": "operation",
+    "id": "1782366507632_06h4ew",
+    "timestamp": 1782366507632
+  },
+  {
     "time": "2026/06/12 16:05:39",
     "level": "info",
     "source": "API 测试",

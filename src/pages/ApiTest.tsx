@@ -55,7 +55,7 @@ let nextRequestId = Date.now()
 
 const bodyTypeMeta: Record<string, { label: string; badge: string; mime: string; color: string; icon: string }> = {
   json:       { label: 'JSON',    badge: 'border-l-green-500 bg-green-50 text-green-700',    mime: 'application/json',                color: 'text-green-600',  icon: '{}' },
-  text:       { label: 'Text',    badge: 'border-l-gray-500 bg-gray-50 text-gray-700',       mime: 'text/plain',                       color: 'text-gray-500',   icon: 'T' },
+  text:       { label: 'Text',    badge: 'border-l-base-content/20 bg-base-200 text-base-content/70', mime: 'text/plain',             color: 'text-base-content/50',   icon: 'T' },
   javascript: { label: 'JavaScript', badge: 'border-l-yellow-500 bg-yellow-50 text-yellow-700', mime: 'application/javascript',       color: 'text-yellow-600', icon: 'JS' },
   html:       { label: 'HTML',    badge: 'border-l-orange-500 bg-orange-50 text-orange-700', mime: 'text/html',                        color: 'text-orange-600', icon: '</>' },
   xml:        { label: 'XML',     badge: 'border-l-blue-500 bg-blue-50 text-blue-700',       mime: 'application/xml',                  color: 'text-blue-600',   icon: '<>' },

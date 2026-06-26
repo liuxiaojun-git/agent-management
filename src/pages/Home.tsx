@@ -106,7 +106,7 @@ export default function Home() {
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-5">
         {cards.map((card, idx) => (
           <div key={idx} className="rounded-2xl border-2 border-base-300 bg-base-100 p-4 transition-all hover:border-primary/20 hover:shadow-md">
-            <p className="text-xs font-black text-[#717986]">{card.label}</p>
+            <p className="text-xs font-black text-base-content/60">{card.label}</p>
             <div className="flex items-baseline gap-2 mt-2">
               <span className="text-2xl font-bold tracking-tight text-base-content">{card.value}</span>
               {card.detail && <span className="text-xs text-base-content/40">{card.detail}</span>}
