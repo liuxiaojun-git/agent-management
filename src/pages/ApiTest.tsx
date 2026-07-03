@@ -823,7 +823,7 @@ export default function ApiTest() {
                               </button>
                             </li>
                             <li>
-                              <button className="text-xs text-red-500" onClick={(e) => { e.stopPropagation(); setDeleteTarget(r.id); }}>
+                              <button className="text-xs text-error" onClick={(e) => { e.stopPropagation(); setDeleteTarget(r.id); }}>
                                 删除
                               </button>
                             </li>
@@ -991,7 +991,7 @@ export default function ApiTest() {
                     <input type="text" className="input input-ghost input-xs w-1/3 text-xs" placeholder="Key" value={h.key} onChange={(e) => updateHeader(i, 'key', e.target.value)} />
                     <input type="text" className="input input-ghost input-xs w-1/2 text-xs" placeholder="Value" value={h.value} onChange={(e) => updateHeader(i, 'value', e.target.value)} />
                     <button className="btn btn-ghost btn-xs btn-square" onClick={() => removeHeader(i)}>
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-base-content/30 hover:text-red-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-base-content/30 hover:text-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
                     </button>
                   </div>
                 ))}
@@ -1028,6 +1028,17 @@ export default function ApiTest() {
                 suppressContentEditableWarning
                 onInput={(e) => setBody((e.target as HTMLElement).textContent || '')}
                 onScroll={syncBodyScroll}
+                onPaste={(e) => {
+                  e.preventDefault()
+                  const text = e.clipboardData.getData('text/plain')
+                  // 自动识别 JSON 并切换 body 类型
+                  const trimmed = text.trim()
+                  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                    try { JSON.parse(trimmed); setBodyType('json') } catch {}
+                  }
+                  // 直接设置 body 状态，由 useEffect 同步更新 DOM 和高亮
+                  setBody(text)
+                }}
                 data-placeholder={`输入 ${bodyTypeMeta[bodyType].label}...`}
               />
             </div>
@@ -1171,7 +1182,7 @@ export default function ApiTest() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setDeleteTarget(null)}>
           <div className="w-full max-w-xs rounded-box bg-base-100 p-6 shadow-xl" onClick={(e) => e.stopPropagation()}>
             <div className="mb-2 text-center">
-              <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-red-50 text-red-500">
+              <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-error/10 text-error">
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
               </div>
               <h3 className="font-bold text-base">确认删除</h3>

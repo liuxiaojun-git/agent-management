@@ -123,7 +123,7 @@ export default function RunLogs() {
                   <td className="text-sm text-base-content truncate w-50" title={log.id}>{log.id}</td>
                   <td className="truncate w-30">
                     {log.status ? (
-                      <span className={`inline-flex items-center h-6 gap-1 rounded-sm px-2 text-sm font-medium text-white ${log.status === 'success' ? 'bg-success' : 'bg-red-600/90'}`}>
+                      <span className={`inline-flex items-center h-6 gap-1 rounded-sm px-2 text-sm font-medium text-white ${log.status === 'success' ? 'bg-success' : 'bg-error/80'}`}>
                         {log.status === 'success' ? '成功' : '失败'}
                       </span>
                     ) : (
@@ -181,7 +181,7 @@ export default function RunLogs() {
               )}
               <div className="flex gap-12 py-3">
                 <span className="text-base-content/50 shrink-0 w-24">状态：</span>
-                <span className={detailModal.status === 'failed' ? 'text-red-500 font-medium' : 'text-base-content'}>
+                <span className={detailModal.status === 'failed' ? 'text-error font-medium' : 'text-base-content'}>
                   {detailModal.status === 'success' ? '成功' : detailModal.status === 'failed' ? '失败' : '-'}
                 </span>
               </div>
