@@ -1,6 +1,7 @@
 // 模型管理 — AI 模型配置管理，支持模型列表展示、启用/停用、参数编辑等操作
 import { useState, useEffect } from 'react'
 import { addLog } from '../utils/logStore'
+import { apiRequest } from '../utils/api'
 
 interface ModelProvider {
   id: string
@@ -32,12 +33,7 @@ const FILE_KEY = 'model-providers'
 
 async function loadProviders(): Promise<typeof mockProviders> {
   try {
-    const res = await fetch('/api/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'get', name: FILE_KEY }),
-    })
-    const result = await res.json()
+    const result = await apiRequest<typeof mockProviders>('get', FILE_KEY)
     if (result.success && result.data) return result.data
   } catch { /* ignore */ }
   // 本地兜底
@@ -50,11 +46,7 @@ async function loadProviders(): Promise<typeof mockProviders> {
 
 async function saveProviders(data: typeof mockProviders) {
   try {
-    await fetch('/api/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'set', name: FILE_KEY, data }),
-    })
+    await apiRequest('set', FILE_KEY, data)
   } catch { /* ignore */ }
   localStorage.setItem(FILE_KEY, JSON.stringify(data))
 }

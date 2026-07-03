@@ -1,4 +1,4 @@
-const API_URL = '/api/data'
+import { apiRequest } from './api'
 
 export interface LogEntry {
   id: string
@@ -19,28 +19,15 @@ export interface LogEntry {
 
 const fileName = (cat: string) => cat === 'audit' ? 'app-logs-run' : 'app-logs-operation'
 
-async function apiRequest(action: 'get' | 'set', name: string, data?: unknown) {
-  try {
-    const res = await fetch(API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action, name, data }),
-    })
-    return await res.json()
-  } catch {
-    return { success: false }
-  }
-}
-
 export async function getLogs(cat?: string): Promise<LogEntry[]> {
   if (cat) {
-    const result = await apiRequest('get', fileName(cat))
+    const result = await apiRequest<LogEntry[]>('get', fileName(cat))
     return result.success ? (result.data || []) : []
   }
   // 读取两个文件合并
   const [op, au] = await Promise.all([
-    apiRequest('get', fileName('operation')),
-    apiRequest('get', fileName('audit')),
+    apiRequest<LogEntry[]>('get', fileName('operation')),
+    apiRequest<LogEntry[]>('get', fileName('audit')),
   ])
   const all = [...(op.success ? op.data || [] : []), ...(au.success ? au.data || [] : [])]
   all.sort((a: LogEntry, b: LogEntry) => b.timestamp - a.timestamp)

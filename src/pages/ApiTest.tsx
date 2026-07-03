@@ -1,7 +1,7 @@
 // API 测试 — 接口调试工具，支持请求编辑、发送、响应查看、历史记录保存与多标签管理
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { addLog } from '../utils/logStore'
-import { getSavedRequests, setSavedRequests as storeSaveRequests, type SavedRequest } from '../utils/requestStore'
+import { getSavedRequests, getCollections, getCollapsedCollections, setSavedRequests as storeSaveRequests, setCollections as storeSetCollections, setCollapsedCollections as storeSetCollapsedCollections, type SavedRequest, type Collection } from '../utils/requestStore'
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
@@ -9,11 +9,6 @@ interface KvPair {
   key: string
   value: string
   enabled: boolean
-}
-
-interface Collection {
-  name: string
-  icon: string
 }
 
 const methodColors: Record<HttpMethod, string> = {
@@ -32,12 +27,6 @@ const methodSelectBg: Record<HttpMethod, string> = {
   DELETE: 'bg-red-50 border-red-300 text-red-600',
 }
 
-const collections: Collection[] = [
-  { name: '默认集合', icon: '📁' },
-  { name: '模型 API', icon: '🧠' },
-  { name: '工作流', icon: '⚡' },
-]
-
 const defaultHeaders: KvPair[] = [
   { key: 'Content-Type', value: 'application/json', enabled: true },
   { key: 'Authorization', value: 'Bearer sk-...', enabled: true },
@@ -51,7 +40,8 @@ const defaultBody = `{
   "temperature": 0.7
 }`
 
-let nextRequestId = Date.now()
+const nowMs = () => Date.now()
+let nextRequestId = nowMs()
 
 const bodyTypeMeta: Record<string, { label: string; badge: string; mime: string; color: string; icon: string }> = {
   json:       { label: 'JSON',    badge: 'border-l-green-500 bg-green-50 text-green-700',    mime: 'application/json',                color: 'text-green-600',  icon: '{}' },
@@ -73,8 +63,21 @@ export default function ApiTest() {
   const [body, setBody] = useState(hasHistory ? initialList[0].body : defaultBody)
 
   // 已保存的请求
+  const initialCollections = getCollections()
   const [savedRequests, setSavedRequests] = useState<SavedRequest[]>(() => initialList)
   const [currentSavedId, setCurrentSavedId] = useState<string | null>(hasHistory ? initialList[0].id : null)
+  const [collections, setCollections] = useState<Collection[]>(initialCollections)
+  const initialCurrentCollection = hasHistory && initialCollections.some(c => c.name === initialList[0].collection)
+    ? initialList[0].collection
+    : initialCollections[0]?.name || '默认集合'
+  const [currentCollection, setCurrentCollection] = useState<string>(initialCurrentCollection)
+  const [collapsedCollections, setCollapsedCollections] = useState<Record<string, boolean>>(() => {
+    const collectionsState = getCollapsedCollections()
+    return {
+      ...Object.fromEntries(initialCollections.map(c => [c.name, false])),
+      ...collectionsState,
+    }
+  })
 
   // 响应
   const firstResponse = hasHistory ? initialList[0].lastResponse : null
@@ -87,6 +90,9 @@ export default function ApiTest() {
     body: string
   } | null>(firstResponse || null)
   const [sending, setSending] = useState(false)
+  const abortControllers = useRef<AbortController[]>([])
+  const timeoutIds = useRef<ReturnType<typeof setTimeout>[]>([])
+  const cancelRequested = useRef(false)
   const [activeResponseTab, setActiveResponseTab] = useState<'body' | 'headers' | 'concurrent'>('body')
   // 并发测试
   const cfg = hasHistory ? initialList[0].concurrentConfig : null
@@ -135,7 +141,7 @@ export default function ApiTest() {
         method, url,
         headers: headers.map(h => ({ ...h })),
         body,
-        collection: collections[0].name,
+        collection: currentCollection,
         savedAt: now,
         lastResponse: response ? { status: response.status, statusText: response.statusText, time: response.time, size: response.size, body: response.body, headers: response.headers } : undefined,
         concurrentResults: concurrentResults || undefined,
@@ -230,6 +236,8 @@ export default function ApiTest() {
 
   // 自动持久化到文件
   useEffect(() => { storeSaveRequests(savedRequests) }, [savedRequests])
+  useEffect(() => { storeSetCollections(collections) }, [collections])
+  useEffect(() => { storeSetCollapsedCollections(collapsedCollections) }, [collapsedCollections])
 
   const getApiPath = (u: string) => { try { return new URL(u).pathname } catch { return u } }
   const getModelName = () => { try { return JSON.parse(body).model || '' } catch { return '' } }
@@ -240,9 +248,92 @@ export default function ApiTest() {
     setTimeout(() => setToast(null), 2000)
   }
 
+  useEffect(() => {
+    storeSetCollections(collections)
+  }, [collections])
+
+  const isValidCollectionName = (value: string) => /^[\p{L}\p{N}\s_-]+$/u.test(value)
+
+  const addCollection = () => {
+    const name = window.prompt('请输入新集合名称')?.trim()
+    if (!name) return
+    if (!isValidCollectionName(name)) {
+      showToast('⚠️ 集合名称仅支持中文、字母、数字、空格、下划线和短横线')
+      return
+    }
+    if (collections.some(c => c.name.toLowerCase() === name.toLowerCase())) {
+      showToast('⚠️ 集合已存在')
+      return
+    }
+    setCollections(prev => [...prev, { name, icon: '📁' }])
+    setCollapsedCollections(prev => ({ ...prev, [name]: false }))
+    setCurrentCollection(name)
+    showToast('✅ 已创建新集合')
+  }
+
+  const renameCollection = (name: string) => {
+    const newName = window.prompt('请输入新集合名称', name)?.trim()
+    if (!newName || newName === name) return
+    if (!isValidCollectionName(newName)) {
+      showToast('⚠️ 集合名称仅支持中文、字母、数字、空格、下划线和短横线')
+      return
+    }
+    if (collections.some(c => c.name.toLowerCase() === newName.toLowerCase() && c.name !== name)) {
+      showToast('⚠️ 集合已存在')
+      return
+    }
+    setCollections(prev => prev.map(c => c.name === name ? { ...c, name: newName } : c))
+    setCollapsedCollections(prev => {
+      const { [name]: collapsed, ...rest } = prev
+      return { ...rest, [newName]: collapsed ?? false }
+    })
+    setSavedRequests(prev => {
+      const next = prev.map(r => r.collection === name ? { ...r, collection: newName } : r)
+      return next
+    })
+    if (currentCollection === name) setCurrentCollection(newName)
+    showToast('✅ 修改集合名称成功')
+  }
+
+  const deleteCollection = (name: string) => {
+    const targetCollections = collections.filter(c => c.name !== name)
+    if (targetCollections.length === 0) {
+      showToast('⚠️ 需保留至少一个集合')
+      return
+    }
+    const target = targetCollections[0].name
+    const hasRequests = savedRequests.some(r => r.collection === name)
+    if (hasRequests && !window.confirm(`集合 “${name}” 包含 ${savedRequests.filter(r => r.collection === name).length} 条请求，删除后会移动到“${target}”。确认删除？`)) {
+      return
+    }
+    setCollections(targetCollections)
+    setCollapsedCollections(prev => {
+      const next = { ...prev }
+      delete next[name]
+      return next
+    })
+    setSavedRequests(prev => prev.map(r => r.collection === name ? { ...r, collection: target } : r))
+    if (currentCollection === name) setCurrentCollection(target)
+    showToast('✅ 删除集合成功')
+  }
+
   // 并发发送请求（每秒 N 路，持续 M 秒）
+  const cancelSend = () => {
+    if (!sending) return
+    cancelRequested.current = true
+    abortControllers.current.forEach(controller => controller.abort())
+    abortControllers.current = []
+    timeoutIds.current.forEach(clearTimeout)
+    timeoutIds.current = []
+    setSending(false)
+    showToast('已取消发送')
+  }
+
   const handleConcurrentSend = async () => {
     if (!url.trim()) { showToast('⚠️ 请输入 URL'); return }
+    cancelRequested.current = false
+    abortControllers.current = []
+    timeoutIds.current = []
     setSending(true)
     setResponse(null)
     setConcurrentResults(null)
@@ -250,7 +341,6 @@ export default function ApiTest() {
     const perSec = concurrentCount
     const seconds = concurrentDuration
     const results: { index: number; status: number; time: string }[] = []
-    // eslint-disable-next-line react-hooks/purity
     const startTime = Date.now()
 
     // 构建 Headers
@@ -278,7 +368,9 @@ export default function ApiTest() {
         const idx = ++seq
         const t0 = performance.now()
         const ac = new AbortController()
+        abortControllers.current.push(ac)
         const tid = setTimeout(() => ac.abort(), timeoutMs)
+        timeoutIds.current.push(tid)
         try {
           const res = await fetch(url, { ...fetchOptions, signal: ac.signal })
           const t1 = performance.now()
@@ -297,9 +389,12 @@ export default function ApiTest() {
           results.push({ index: idx, status: 0, time: ((t1 - t0) / 1000).toFixed(2) + 's' })
         } finally {
           clearTimeout(tid)
+          timeoutIds.current = timeoutIds.current.filter((id) => id !== tid)
+          abortControllers.current = abortControllers.current.filter((c) => c !== ac)
         }
       })
       await Promise.allSettled(batch)
+      if (cancelRequested.current) break
       if (sec < seconds - 1) {
         await new Promise(r => setTimeout(r, 1000))
       }
@@ -307,10 +402,33 @@ export default function ApiTest() {
 
     clearInterval(progressInterval)
 
-    // eslint-disable-next-line react-hooks/purity
-    const endTime = Date.now()
+    const endTime = nowMs()
     const totalTime = ((endTime - startTime) / 1000).toFixed(2)
     setConcurrentResults(results)
+
+    if (cancelRequested.current) {
+      setResponse({
+        status: 0,
+        statusText: '已取消',
+        time: `${totalTime}s`,
+        size: `${results.length} 次请求`,
+        headers: {},
+        body: JSON.stringify({
+          error: '压测已取消',
+          hint: '当前并发发送已被手动取消，不会保存结果。',
+          completed: `${results.length} 次请求已完成`,
+        }, null, 2),
+      })
+      setSending(false)
+      cancelRequested.current = false
+      abortControllers.current = []
+      timeoutIds.current = []
+      showToast('已取消发送')
+      return
+    }
+
+    abortControllers.current = []
+    timeoutIds.current = []
 
     // 汇总统计
     const success = results.filter(r => r.status >= 200 && r.status < 300).length
@@ -377,7 +495,7 @@ export default function ApiTest() {
     setSending(true)
     setResponse(null)
 
-    const startTime = Date.now()
+    const startTime = nowMs()
 
     try {
       // 构建 Headers
@@ -397,10 +515,19 @@ export default function ApiTest() {
       }
 
       const timeoutMs = requestTimeout * 1000
+      cancelRequested.current = false
+      abortControllers.current = []
+      timeoutIds.current = []
       const controller = new AbortController()
+      abortControllers.current.push(controller)
       const timer = setTimeout(() => controller.abort(), timeoutMs)
-      const res = await fetch(url, { ...fetchOptions, signal: controller.signal }).finally(() => clearTimeout(timer))
-      const endTime = Date.now()
+      timeoutIds.current.push(timer)
+      const res = await fetch(url, { ...fetchOptions, signal: controller.signal }).finally(() => {
+        clearTimeout(timer)
+        timeoutIds.current = timeoutIds.current.filter((id) => id !== timer)
+        abortControllers.current = abortControllers.current.filter((c) => c !== controller)
+      })
+      const endTime = nowMs()
       const duration = ((endTime - startTime) / 1000).toFixed(2) + 's'
 
       // 读取响应体
@@ -450,37 +577,45 @@ export default function ApiTest() {
         category: 'operation',
       })
     } catch (err) {
-      const endTime = Date.now()
+      const endTime = nowMs()
       const duration = ((endTime - startTime) / 1000).toFixed(2) + 's'
+      const isAbort = (err as Error).name === 'AbortError'
+      const isCanceled = isAbort && cancelRequested.current
 
       setResponse({
         status: 0,
-        statusText: '请求失败',
+        statusText: isCanceled ? '已取消' : '请求失败',
         time: duration,
         size: '0 B',
         headers: {},
         body: JSON.stringify({
-          error: (err as Error).name === 'AbortError' ? '请求超时' : (err as Error).message,
-          hint: (err as Error).name === 'AbortError'
-            ? `请求超过 ${requestTimeout} 秒未返回，已自动中止。可增大超时时间或检查服务端响应速度。`
-            : '可能的原因：CORS 跨域限制、网络不通、URL 格式错误、HTTPS 证书问题',
+          error: isCanceled ? '请求已取消' : '请求超时',
+          hint: isCanceled
+            ? '已手动取消发送，不会保存当前请求。'
+            : `请求超过 ${requestTimeout} 秒未返回，已自动中止。可增大超时时间或检查服务端响应速度。`,
         }, null, 2),
       })
-      await addLog({
-        time: nowStr(),
-        level: 'error',
-        source: 'API 测试',
-        message: `${method} ${url} → 请求失败`,
-        detail: `耗时 ${duration} · ${(err as Error).name === 'AbortError' ? '超时' : (err as Error).message}`,
-        status: 'failed',
-        duration,
-        api: getApiPath(url),
-        model: getModelName(),
-        category: 'operation',
-      })
+      if (!isCanceled) {
+        await addLog({
+          time: nowStr(),
+          level: 'error',
+          source: 'API 测试',
+          message: `${method} ${url} → 请求失败`,
+          detail: `耗时 ${duration} · ${(err as Error).name === 'AbortError' ? '超时' : (err as Error).message}`,
+          status: 'failed',
+          duration,
+          api: getApiPath(url),
+          model: getModelName(),
+          category: 'operation',
+        })
+      }
     } finally {
+      const wasCanceled = cancelRequested.current
       setSending(false)
-      autoSave()
+      cancelRequested.current = false
+      abortControllers.current = []
+      timeoutIds.current = []
+      if (!wasCanceled) autoSave()
     }
   }
 
@@ -524,7 +659,7 @@ export default function ApiTest() {
           label, method, url,
           headers: headers.map(h => ({ ...h })),
           body,
-          collection: collections[0].name,
+          collection: currentCollection,
           savedAt: now,
           lastResponse: response ? { status: response.status, statusText: response.statusText, time: response.time, size: response.size, body: response.body, headers: response.headers } : undefined,
           concurrentResults: concurrentResults || undefined,
@@ -744,23 +879,6 @@ export default function ApiTest() {
           <h1 className="text-2xl font-bold">API 测试</h1>
           <p className="text-base-content/60 mt-1"></p>
         </div>
-        <button className="btn btn-primary" onClick={() => {
-          setMethod('GET')
-          setUrl('')
-          setHeaders([{ key: 'Content-Type', value: 'application/json', enabled: true }])
-          setBody('')
-          setCurrentSavedId(null)
-          setResponse(null)
-          setConcurrentResults(null)
-          setConcurrentMode(false)
-          setConcurrentCount(5)
-          setConcurrentDuration(10)
-          setRequestTimeout(30)
-          showToast('✨ 新建请求')
-        }}>
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
-          新建
-        </button>
       </div>
 
       {/* 工具区 */}
@@ -778,14 +896,13 @@ export default function ApiTest() {
         <>
           <div className="fixed inset-0 z-30 bg-black/30 lg:hidden" onClick={() => setShowSidebar(false)} />
           <aside className="fixed left-0 top-0 z-40 flex h-full flex-col border-r border-base-200 bg-base-100 lg:relative lg:z-auto lg:border-r" style={{ width: sidebarWidth }}>
-            <div className="flex items-center justify-between border-b border-base-200 px-4 py-3">
-              <h2 className="text-sm font-semibold">历史记录</h2>
-              <div className="flex items-center gap-1">
-                <span className="text-[10px] text-base-content/30">{savedRequests.length} 项</span>
-                <button className="btn btn-ghost btn-square btn-xs lg:hidden" onClick={() => setShowSidebar(false)}>
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-                </button>
-              </div>
+            <div className="flex items-center gap-2 border-b border-base-200 px-4 py-3">
+              <div className="flex items-center gap-2">
+                  <h2 className="text-sm font-semibold">接口信息</h2>
+                </div>
+              <button className="btn btn-ghost btn-square btn-xs lg:hidden" onClick={() => setShowSidebar(false)}>
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+              </button>
             </div>
 
             <div className="flex-1 overflow-y-auto p-2">
@@ -795,67 +912,116 @@ export default function ApiTest() {
                   <span>暂无保存的配置</span>
                 </div>
               ) : (
-                grouped.map(g => g.items.length > 0 && (
-                  <div key={g.name} className="mb-2">
-                    <div className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-medium uppercase tracking-wider text-base-content/40">
-                      {g.icon} {g.name}
-                      <span className="text-base-content/20 ml-1">({g.items.length})</span>
-                    </div>
-                    {g.items.map(r => (
-                      <div
-                        key={r.id}
-                        className={`group flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors hover:bg-base-200 cursor-pointer ${
-                          currentSavedId === r.id ? 'bg-primary/5 ring-1 ring-primary/20' : ''
-                        }`}
-                        onClick={() => loadRequest(r)}
-                      >
-                        <span className={`font-mono font-bold text-[10px] w-10 shrink-0 ${methodColors[r.method as HttpMethod]}`}>
-                          {r.method}
-                        </span>
-                        <div className="flex-1 min-w-0">
-                          <div className="truncate font-medium text-base-content">{r.label}</div>
-                          <div className="truncate text-base-content/30 text-[10px]">{r.url}</div>
-                        </div>
-                        {/* 上次调试结果 */}
-                        {r.concurrentSummary ? (
-                          <div className="shrink-0 text-[10px] mr-0.5 flex items-center gap-1">
-                            <span className="text-green-600">{r.concurrentSummary.success}✓</span>
-                            {r.concurrentSummary.failed > 0 && <span className="text-red-500">{r.concurrentSummary.failed}✗</span>}
-                          </div>
-                        ) : r.lastResponse && (
-                          <div className={`shrink-0 text-[10px] font-bold mr-0.5 ${
-                            r.lastResponse.status >= 400 ? 'text-red-500' : r.lastResponse.status >= 300 ? 'text-amber-500' : 'text-green-600'
-                          }`}>
-                            {r.lastResponse.status}
-                          </div>
-                        )}
-                        {/* 三点操作菜单 */}
-                        <div className="dropdown dropdown-end shrink-0 opacity-0 group-hover:opacity-100">
-                          <button
-                            tabIndex={0}
-                            className="btn btn-ghost btn-xs btn-square"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="5" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="12" cy="19" r="1" /></svg>
+                grouped.map(g => {
+                  const isCollapsed = !!collapsedCollections[g.name]
+                  return (
+                    <div key={g.name} className="mb-2 space-y-3">
+                      <div className="flex items-center gap-1 px-2 py-1.5 text-[10px] font-medium tracking-wider text-base-content/40">
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-square btn-xs"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setCollapsedCollections(prev => ({ ...prev, [g.name]: !prev[g.name] }))
+                          }}
+                          title={isCollapsed ? '展开集合' : '折叠集合'}
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" className={`h-3.5 w-3.5 transition-transform ${isCollapsed ? '' : 'rotate-90'}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9" /></svg>
+                        </button>
+                        <span>{g.icon}</span>
+                        <span>{g.name}</span>
+                        <span className="text-base-content/20 ml-1">({g.items.length})</span>
+                        <div className="ml-auto flex items-center gap-1">
+                          <button type="button" className="btn btn-ghost btn-square btn-xs" onClick={(e) => {
+                            e.stopPropagation()
+                            setMethod('GET')
+                            setUrl('')
+                            setHeaders([{ key: 'Content-Type', value: 'application/json', enabled: true }])
+                            setBody('')
+                            setCurrentSavedId(null)
+                            setResponse(null)
+                            setConcurrentResults(null)
+                            setConcurrentMode(false)
+                            setConcurrentCount(5)
+                            setConcurrentDuration(10)
+                            setRequestTimeout(30)
+                            showToast('✨ 新建请求')
+                          }} title="新建请求">
+                            <span className="text-lg leading-none">+</span>
                           </button>
-                          <ul tabIndex={0} className="menu dropdown-content z-1 mt-1 w-28 rounded-box bg-base-100 p-1 shadow-lg">
-                            <li>
-                              <button className="text-xs" onClick={(e) => { e.stopPropagation(); openRename(r, e); }}>
-                                重命名
-                              </button>
-                            </li>
-                            <li>
-                              <button className="text-xs text-error" onClick={(e) => { e.stopPropagation(); setDeleteTarget(r.id); }}>
-                                删除
-                              </button>
-                            </li>
-                          </ul>
+                          <button type="button" className="btn btn-ghost btn-square btn-xs" onClick={(e) => { e.stopPropagation(); renameCollection(g.name) }} title="重命名集合">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+                          </button>
+                          <button type="button" className="btn btn-ghost btn-square btn-xs" onClick={(e) => { e.stopPropagation(); deleteCollection(g.name) }} title="删除集合">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6v14h12V6"/></svg>
+                          </button>
                         </div>
                       </div>
-                    ))}
-                  </div>
-                ))
+                      {!isCollapsed && (
+                        g.items.length === 0 ? (
+                          <div className="rounded-lg border border-dashed border-base-200 bg-base-200/40 p-3 text-[11px] text-base-content/40">
+                            当前集合暂无请求
+                          </div>
+                        ) : g.items.map(r => (
+                          <div
+                            key={r.id}
+                            className={`group flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors hover:bg-base-200 cursor-pointer ${
+                              currentSavedId === r.id ? 'bg-primary/5 ring-1 ring-primary/20' : ''
+                            }`}
+                            onClick={() => loadRequest(r)}
+                          >
+                            <span className={`font-mono font-bold text-[10px] w-10 shrink-0 ${methodColors[r.method as HttpMethod]}`}>
+                              {r.method}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <div className="truncate font-medium text-base-content">{r.label}</div>
+                              <div className="truncate text-base-content/30 text-[10px]">{r.url}</div>
+                            </div>
+                            {/* 上次调试结果 */}
+                            {r.concurrentSummary ? (
+                              <div className="shrink-0 text-[10px] mr-0.5 flex items-center gap-1">
+                                <span className="text-green-600">{r.concurrentSummary.success}✓</span>
+                                {r.concurrentSummary.failed > 0 && <span className="text-red-500">{r.concurrentSummary.failed}✗</span>}
+                              </div>
+                            ) : r.lastResponse && (
+                              <div className={`shrink-0 text-[10px] font-bold mr-0.5 ${
+                                r.lastResponse.status >= 400 ? 'text-red-500' : r.lastResponse.status >= 300 ? 'text-amber-500' : 'text-green-600'
+                              }`}>
+                                {r.lastResponse.status}
+                              </div>
+                            )}
+                            {/* 三点操作菜单 */}
+                            <div className="dropdown dropdown-end shrink-0 opacity-0 group-hover:opacity-100">
+                              <button
+                                tabIndex={0}
+                                className="btn btn-ghost btn-xs btn-square"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 text-base-content/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="5" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="12" cy="19" r="1" /></svg>
+                              </button>
+                              <ul tabIndex={0} className="menu dropdown-content z-1 mt-1 w-28 rounded-box bg-base-100 p-1 shadow-lg">
+                                <li>
+                                  <button className="text-xs" onClick={(e) => { e.stopPropagation(); openRename(r, e); }}>
+                                    重命名
+                                  </button>
+                                </li>
+                                <li>
+                                  <button className="text-xs text-error" onClick={(e) => { e.stopPropagation(); setDeleteTarget(r.id); }}>
+                                    删除
+                                  </button>
+                                </li>
+                              </ul>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )
+                })
               )}
+            </div>
+            <div className="border-t border-base-200 px-4 py-2 flex justify-center">
+              <button type="button" className="btn btn-ghost btn-block" onClick={addCollection} title="新建集合">+ 新建集合</button>
             </div>
           </aside>
           {/* 侧边栏拖拽手柄 */}
@@ -964,6 +1130,16 @@ export default function ApiTest() {
             )}
             {sending ? '发送中...' : concurrentMode ? `QPS ${concurrentCount} · ${concurrentCount * concurrentDuration} 次` : '发送'}
           </button>
+          {sending && (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm text-error gap-1.5"
+              onClick={cancelSend}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+              取消
+            </button>
+          )}
         </div>
 
         {/* ===== 请求配置 Tab ===== */}
