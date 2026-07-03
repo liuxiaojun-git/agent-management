@@ -1028,6 +1028,17 @@ export default function ApiTest() {
                 suppressContentEditableWarning
                 onInput={(e) => setBody((e.target as HTMLElement).textContent || '')}
                 onScroll={syncBodyScroll}
+                onPaste={(e) => {
+                  e.preventDefault()
+                  const text = e.clipboardData.getData('text/plain')
+                  // 自动识别 JSON 并切换 body 类型
+                  const trimmed = text.trim()
+                  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                    try { JSON.parse(trimmed); setBodyType('json') } catch {}
+                  }
+                  // 直接设置 body 状态，由 useEffect 同步更新 DOM 和高亮
+                  setBody(text)
+                }}
                 data-placeholder={`输入 ${bodyTypeMeta[bodyType].label}...`}
               />
             </div>
