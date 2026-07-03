@@ -703,7 +703,29 @@ export default function ApiTest() {
       const typeChanged = prevType.current !== bodyType
       prevType.current = bodyType
       if (typeChanged || bodyRef.current.textContent !== body) {
+        // 光标位置
+        const sel = window.getSelection()
+        const hadFocus = document.activeElement === bodyRef.current
+        let startOffset = 0
+        if (hadFocus && sel && sel.rangeCount > 0) {
+          const range = sel.getRangeAt(0)
+          if (bodyRef.current.contains(range.startContainer)) {
+            startOffset = range.startOffset
+          }
+        }
         bodyRef.current.innerHTML = highlighters[bodyType](body) || ''
+        // 恢复光标
+        if (hadFocus) {
+          bodyRef.current.focus()
+          const newRange = document.createRange()
+          newRange.selectNodeContents(bodyRef.current)
+          newRange.collapse(false) // 末尾
+          if (startOffset > 0 && bodyRef.current.firstChild) {
+            try { newRange.setStart(bodyRef.current.firstChild, Math.min(startOffset, bodyRef.current.textContent?.length || 0)) } catch { /* 忽略光标越界 */ }
+          }
+          sel?.removeAllRanges()
+          sel?.addRange(newRange)
+        }
       }
     }
   }, [body, bodyType, activeTab, highlighters])
@@ -1034,7 +1056,7 @@ export default function ApiTest() {
                   // 自动识别 JSON 并切换 body 类型
                   const trimmed = text.trim()
                   if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-                    try { JSON.parse(trimmed); setBodyType('json') } catch {}
+                    try { JSON.parse(trimmed); setBodyType('json') } catch { /* 非 JSON 内容忽略 */ }
                   }
                   // 直接设置 body 状态，由 useEffect 同步更新 DOM 和高亮
                   setBody(text)
