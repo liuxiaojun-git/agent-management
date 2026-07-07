@@ -1,8 +1,10 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-// @ts-expect-error .mjs file has no type declarations
+// @ts-ignore .mjs file has no type declarations
 import { dataApiPlugin } from './server/api.mjs'
+// @ts-ignore .mjs file has no type declarations
+import { proxyApiPlugin } from './server/proxyApi.mjs'
 
 // https://vite.dev/config/
 export default defineConfig(({ command, mode }) => {
@@ -12,7 +14,7 @@ export default defineConfig(({ command, mode }) => {
 
   return {
     base,
-    plugins: [react(), tailwindcss(), ...(command === 'serve' ? [dataApiPlugin()] : [])],
+    plugins: [react(), tailwindcss(), ...(command === 'serve' ? [dataApiPlugin(), proxyApiPlugin()] : [])],
     server: {
       host: '0.0.0.0',
       port: Number(env.VITE_DEV_PORT) || 5173,

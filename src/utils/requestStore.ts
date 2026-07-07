@@ -104,6 +104,20 @@ export function getCollections(): Collection[] {
   return getCacheData().collections
 }
 
+export async function hydrateStoreFromFile(): Promise<SavedRequestStore> {
+  const fileData = await fetchFromFile()
+  const normalized: SavedRequestStore = {
+    collections: Array.isArray(fileData.collections) && fileData.collections.length > 0 ? fileData.collections : getCacheData().collections,
+    requests: Array.isArray(fileData.requests) ? fileData.requests : [],
+    collapsedCollections: typeof fileData.collapsedCollections === 'object' && fileData.collapsedCollections !== null
+      ? fileData.collapsedCollections
+      : getCacheData().collapsedCollections || {},
+  }
+  cache = normalized
+  syncToLocal(normalized)
+  return normalized
+}
+
 // 同步更新并异步持久化
 export function setSavedRequests(data: SavedRequest[]) {
   const current = getCacheData()

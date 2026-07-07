@@ -3,6 +3,7 @@ import { promises as fs } from 'fs'
 import { join, dirname, extname } from 'path'
 import { fileURLToPath } from 'url'
 import { getData, setData } from './storage.mjs'
+import { handleProxyRequest } from './proxy.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const distDir = join(__dirname, '..', 'dist')
@@ -96,6 +97,11 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
   if (url.pathname === apiBase) {
     await handleApiRequest(req, res)
+    return
+  }
+
+  if (url.pathname === '/api/proxy') {
+    await handleProxyRequest(req, res)
     return
   }
 

@@ -1,7 +1,10 @@
 // API 测试 — 接口调试工具，支持请求编辑、发送、响应查看、历史记录保存与多标签管理
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { flushSync } from 'react-dom'
 import { addLog } from '../utils/logStore'
-import { getSavedRequests, getCollections, getCollapsedCollections, setSavedRequests as storeSaveRequests, setCollections as storeSetCollections, setCollapsedCollections as storeSetCollapsedCollections, type SavedRequest, type Collection } from '../utils/requestStore'
+import { createRequestGuard } from '../utils/requestGuard.ts'
+import { proxyRequest } from '../utils/api'
+import { getSavedRequests, getCollections, getCollapsedCollections, setSavedRequests as storeSaveRequests, setCollections as storeSetCollections, setCollapsedCollections as storeSetCollapsedCollections, hydrateStoreFromFile, type SavedRequest, type Collection } from '../utils/requestStore'
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
@@ -93,6 +96,7 @@ export default function ApiTest() {
   const abortControllers = useRef<AbortController[]>([])
   const timeoutIds = useRef<ReturnType<typeof setTimeout>[]>([])
   const cancelRequested = useRef(false)
+  const sendGuardRef = useRef(createRequestGuard())
   const [activeResponseTab, setActiveResponseTab] = useState<'body' | 'headers' | 'concurrent'>('body')
   // 并发测试
   const cfg = hasHistory ? initialList[0].concurrentConfig : null
@@ -239,6 +243,43 @@ export default function ApiTest() {
   useEffect(() => { storeSetCollections(collections) }, [collections])
   useEffect(() => { storeSetCollapsedCollections(collapsedCollections) }, [collapsedCollections])
 
+  useEffect(() => {
+    let cancelled = false
+    const loadPersistedRequests = async () => {
+      try {
+        const persisted = await hydrateStoreFromFile()
+        if (cancelled) return
+        if (persisted.requests.length === 0) return
+
+        const first = persisted.requests[0]
+        setSavedRequests(persisted.requests)
+        setCollections(persisted.collections)
+        setCollapsedCollections(persisted.collapsedCollections || {})
+        setCurrentSavedId(first.id)
+        setMethod(first.method as HttpMethod)
+        setUrl(first.url)
+        setHeaders(first.headers.map(h => ({ ...h })))
+        setBody(first.body)
+        setResponse(first.lastResponse || null)
+        setConcurrentMode(first.concurrentConfig?.mode ?? false)
+        setConcurrentCount(first.concurrentConfig?.count ?? 5)
+        setConcurrentDuration(first.concurrentConfig?.duration ?? 10)
+        setRequestTimeout(first.concurrentConfig?.timeout ?? 600)
+        setConcurrentResults(first.concurrentResults || null)
+        setCurrentCollection(
+          persisted.collections.some(c => c.name === first.collection)
+            ? first.collection
+            : persisted.collections[0]?.name || '默认集合'
+        )
+      } catch {
+        // 忽略恢复失败，保留当前已加载的状态
+      }
+    }
+
+    loadPersistedRequests()
+    return () => { cancelled = true }
+  }, [])
+
   const getApiPath = (u: string) => { try { return new URL(u).pathname } catch { return u } }
   const getModelName = () => { try { return JSON.parse(body).model || '' } catch { return '' } }
   const nowStr = () => { const d = new Date(); return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}` }
@@ -331,12 +372,16 @@ export default function ApiTest() {
 
   const handleConcurrentSend = async () => {
     if (!url.trim()) { showToast('⚠️ 请输入 URL'); return }
+    if (!sendGuardRef.current.begin()) {
+      showToast('⏳ 请求正在发送，请稍后再试')
+      return
+    }
     cancelRequested.current = false
     abortControllers.current = []
     timeoutIds.current = []
     setSending(true)
     setResponse(null)
-    setConcurrentResults(null)
+    setConcurrentResults([])
 
     const perSec = concurrentCount
     const seconds = concurrentDuration
@@ -357,12 +402,6 @@ export default function ApiTest() {
     const timeoutMs = requestTimeout * 1000
     let seq = 0
 
-    // 显示进度
-    const progressInterval = setInterval(() => {
-      setConcurrentResults([...results])
-    }, 200)
-
-    // 逐秒发送
     for (let sec = 0; sec < seconds; sec++) {
       const batch = Array.from({ length: perSec }, async () => {
         const idx = ++seq
@@ -374,7 +413,11 @@ export default function ApiTest() {
         try {
           const res = await fetch(url, { ...fetchOptions, signal: ac.signal })
           const t1 = performance.now()
-          results.push({ index: idx, status: res.status, time: ((t1 - t0) / 1000).toFixed(2) + 's' })
+          const entry = { index: idx, status: res.status, time: ((t1 - t0) / 1000).toFixed(2) + 's' }
+          results.push(entry)
+          flushSync(() => {
+            setConcurrentResults(prev => (prev ? [...prev, entry] : [entry]))
+          })
           if (!sampleBody) {
             sampleStatus = res.status
             sampleStatusText = res.statusText || (res.ok ? 'OK' : 'Error')
@@ -386,7 +429,11 @@ export default function ApiTest() {
           }
         } catch {
           const t1 = performance.now()
-          results.push({ index: idx, status: 0, time: ((t1 - t0) / 1000).toFixed(2) + 's' })
+          const entry = { index: idx, status: 0, time: ((t1 - t0) / 1000).toFixed(2) + 's' }
+          results.push(entry)
+          flushSync(() => {
+            setConcurrentResults(prev => (prev ? [...prev, entry] : [entry]))
+          })
         } finally {
           clearTimeout(tid)
           timeoutIds.current = timeoutIds.current.filter((id) => id !== tid)
@@ -400,11 +447,8 @@ export default function ApiTest() {
       }
     }
 
-    clearInterval(progressInterval)
-
     const endTime = nowMs()
     const totalTime = ((endTime - startTime) / 1000).toFixed(2)
-    setConcurrentResults(results)
 
     if (cancelRequested.current) {
       setResponse({
@@ -424,6 +468,7 @@ export default function ApiTest() {
       abortControllers.current = []
       timeoutIds.current = []
       showToast('已取消发送')
+      sendGuardRef.current.end()
       return
     }
 
@@ -464,6 +509,7 @@ export default function ApiTest() {
       body: sampleBody || JSON.stringify(results.map(r => ({ '#': r.index, 状态: r.status || (r.status === 0 ? '超时' : r.status), 耗时: r.time })), null, 2),
     })
     setSending(false)
+    sendGuardRef.current.end()
     const totalFailed = timeout + failed
     showToast(`🏁 压测完成: ${success} 成功, ${totalFailed} 失败/超时`)
 
@@ -489,6 +535,10 @@ export default function ApiTest() {
   const handleSend = async () => {
     if (!url.trim()) {
       showToast('⚠️ 请输入 URL')
+      return
+    }
+    if (!sendGuardRef.current.begin()) {
+      showToast('⏳ 请求正在发送，请稍后再试')
       return
     }
 
@@ -522,7 +572,7 @@ export default function ApiTest() {
       abortControllers.current.push(controller)
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       timeoutIds.current.push(timer)
-      const res = await fetch(url, { ...fetchOptions, signal: controller.signal }).finally(() => {
+      const res = await proxyRequest(url, { ...fetchOptions, signal: controller.signal }).finally(() => {
         clearTimeout(timer)
         timeoutIds.current = timeoutIds.current.filter((id) => id !== timer)
         abortControllers.current = abortControllers.current.filter((c) => c !== controller)
@@ -612,6 +662,7 @@ export default function ApiTest() {
     } finally {
       const wasCanceled = cancelRequested.current
       setSending(false)
+      sendGuardRef.current.end()
       cancelRequested.current = false
       abortControllers.current = []
       timeoutIds.current = []
@@ -1037,7 +1088,7 @@ export default function ApiTest() {
       {/* ========== 主区域 ========== */}
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* ===== 工具栏 ===== */}
-        <div className="flex items-center gap-2 border-b border-base-200 bg-base-100 px-4 py-3 flex-wrap">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-base-200 bg-base-100 px-4 py-3">
           <button className="btn btn-ghost btn-square btn-sm lg:hidden" onClick={() => setShowSidebar(true)}>
             <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" /></svg>
           </button>
@@ -1052,7 +1103,7 @@ export default function ApiTest() {
 
           <input
             type="text"
-            className="input input-bordered input-sm flex-1 text-xs"
+            className="input input-bordered input-sm min-w-0 flex-1 text-xs"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             placeholder="https://api.example.com/v1/..."
@@ -1087,7 +1138,7 @@ export default function ApiTest() {
 
           {/* 并发参数 */}
           {concurrentMode && (
-            <div className="flex items-center gap-1.5 text-xs">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs">
               <span className="text-base-content/40">发送速率</span>
               <input
                 type="number"
@@ -1175,7 +1226,7 @@ export default function ApiTest() {
                 </button>
               </div>
               <div className="flex flex-col gap-1.5">
-                <div className="flex items-center gap-2 px-2 text-[10px] text-base-content/30 font-medium uppercase tracking-wider">
+                <div className="flex min-w-0 items-center gap-2 px-2 text-[10px] font-medium uppercase tracking-wider text-base-content/30">
                   <span className="w-6" /><span className="w-1/3">KEY</span><span className="w-1/2">VALUE</span><span className="w-8" />
                 </div>
                 {headers.map((h, i) => (
@@ -1186,8 +1237,8 @@ export default function ApiTest() {
                         : <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-base-content/20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
                       }
                     </button>
-                    <input type="text" className="input input-ghost input-xs w-1/3 text-xs" placeholder="Key" value={h.key} onChange={(e) => updateHeader(i, 'key', e.target.value)} />
-                    <input type="text" className="input input-ghost input-xs w-1/2 text-xs" placeholder="Value" value={h.value} onChange={(e) => updateHeader(i, 'value', e.target.value)} />
+                    <input type="text" className="input input-ghost input-xs min-w-0 w-1/3 text-xs" placeholder="Key" value={h.key} onChange={(e) => updateHeader(i, 'key', e.target.value)} />
+                    <input type="text" className="input input-ghost input-xs min-w-0 w-1/2 text-xs" placeholder="Value" value={h.value} onChange={(e) => updateHeader(i, 'value', e.target.value)} />
                     <button className="btn btn-ghost btn-xs btn-square" onClick={() => removeHeader(i)}>
                       <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 text-base-content/30 hover:text-error" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
                     </button>
@@ -1199,7 +1250,7 @@ export default function ApiTest() {
 
           {activeTab === 'body' && (
             <div className="p-4 pt-0">
-              <div className="sticky top-0 bg-base-100 z-10 pb-3 pt-4 flex items-center gap-2">
+              <div className="sticky top-0 z-10 flex min-w-0 items-center gap-2 bg-base-100 pb-3 pt-4">
                 {/* 类型选择器 */}
                 <div className="dropdown">
                   <button tabIndex={0} className={`inline-flex items-center gap-1 rounded-md border-l-[3px] px-2 py-1 text-xs font-medium transition-colors ${bodyTypeMeta[bodyType].badge}`}>
@@ -1216,8 +1267,8 @@ export default function ApiTest() {
                     ))}
                   </ul>
                 </div>
-                <span className="text-xs text-base-content/30">·</span>
-                <span className="text-xs text-base-content/50">Content-Type: {bodyTypeMeta[bodyType].mime}</span>
+                <span className="shrink-0 text-xs text-base-content/30">·</span>
+                <span className="min-w-0 shrink-0 text-xs text-base-content/50">Content-Type: {bodyTypeMeta[bodyType].mime}</span>
               </div>
               <div
                 ref={bodyRef}
@@ -1279,39 +1330,39 @@ export default function ApiTest() {
 
         {/* ===== 响应面板（常显，可拖拽调整高度） ===== */}
         <div className="shrink-0 bg-base-100 flex flex-col" style={{ height: responseHeight }}>
-          <div className="flex items-center justify-between border-b border-base-200 px-4 py-2">
-            <div className="flex items-center gap-3">
+          <div className="flex items-center justify-between gap-3 border-b border-base-200 px-4 py-2">
+            <div className="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto">
+              {concurrentResults && (() => {
+                const s = concurrentResults.filter(r => r.status >= 200 && r.status < 300).length
+                const f = concurrentResults.filter(r => r.status === 0 || r.status >= 400).length
+                return (
+                  <div className="flex shrink-0 items-center gap-2 whitespace-nowrap text-[11px] font-medium">
+                    <span className="text-green-600">{s}✓</span>
+                    {f > 0 && <span className="text-red-500">{f}✗</span>}
+                    <span className="text-base-content/30">·</span>
+                    <span className="text-base-content/40">{concurrentResults.length} 路</span>
+                  </div>
+                )
+              })()}
               {response ? (
                 <>
-                  <div className={`flex items-center gap-1.5 text-sm font-bold ${response.status >= 400 ? 'text-red-500' : 'text-green-600'}`}>
+                  <div className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm font-bold ${response.status >= 400 ? 'text-red-500' : 'text-green-600'}`}>
                     <span>{response.status}</span>
                     <span className="text-xs font-normal">{response.statusText}</span>
                   </div>
-                  <div className="flex items-center gap-3 text-[11px] text-base-content/40">
+                  <div className="flex shrink-0 items-center gap-3 whitespace-nowrap text-[11px] text-base-content/40">
                     <span>⏱ {response.time}</span>
                     <span>📦 {response.size}</span>
                   </div>
-                  {concurrentResults && (() => {
-                    const s = concurrentResults.filter(r => r.status >= 200 && r.status < 300).length
-                    const f = concurrentResults.filter(r => r.status === 0 || r.status >= 400).length
-                    return (
-                      <div className="flex items-center gap-2 text-[11px] font-medium">
-                        <span className="text-green-600">{s}✓</span>
-                        {f > 0 && <span className="text-red-500">{f}✗</span>}
-                        <span className="text-base-content/30">·</span>
-                        <span className="text-base-content/40">{concurrentResults.length} 路</span>
-                      </div>
-                    )
-                  })()}
                 </>
-              ) : (
-                <div className="flex items-center gap-2 text-xs text-base-content/30">
+              ) : !concurrentResults ? (
+                <div className="flex items-center gap-2 whitespace-nowrap text-xs text-base-content/30">
                   <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></svg>
                   点击「发送」调试接口
                 </div>
-              )}
+              ) : null}
             </div>
-            <div className="flex items-center gap-1">
+            <div className="flex shrink-0 items-center gap-1">
               <button className={`btn btn-ghost btn-xs ${activeResponseTab === 'body' ? 'btn-active' : ''}`} onClick={() => setActiveResponseTab('body')}>Body</button>
               <button className={`btn btn-ghost btn-xs ${activeResponseTab === 'headers' ? 'btn-active' : ''}`} onClick={() => setActiveResponseTab('headers')}>Headers</button>
               <button className={`btn btn-ghost btn-xs ${activeResponseTab === 'concurrent' ? 'btn-active' : ''} ${concurrentMode ? '' : 'opacity-30'}`} onClick={() => setActiveResponseTab('concurrent')}>
@@ -1320,38 +1371,36 @@ export default function ApiTest() {
             </div>
           </div>
           <div className="flex-1 overflow-y-auto p-4">
-            {response ? (
-              activeResponseTab === 'concurrent' ? (
-                concurrentResults ? (
-                  <div className="flex flex-col gap-1">
-                    <div className="flex items-center gap-3 text-[10px] text-base-content/30 font-medium uppercase tracking-wider px-1 pb-1 border-b border-base-200">
-                      <span className="w-8 text-center">#</span>
-                      <span className="w-16 text-center">状态</span>
-                      <span className="w-20 text-center">耗时</span>
-                      <span className="flex-1" />
+            {activeResponseTab === 'concurrent' && concurrentResults ? (
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-3 text-[10px] text-base-content/30 font-medium uppercase tracking-wider px-1 pb-1 border-b border-base-200">
+                  <span className="w-8 text-center">#</span>
+                  <span className="w-16 text-center">状态</span>
+                  <span className="w-20 text-center">耗时</span>
+                  <span className="flex-1" />
+                </div>
+                {concurrentResults.map((r) => (
+                  <div key={r.index} className="flex items-center gap-3 px-1 py-1 text-xs hover:bg-base-200/50 rounded">
+                    <span className="w-8 text-center text-base-content/40">{r.index}</span>
+                    <span className={`w-16 text-center font-bold ${r.status === 0 ? 'text-red-500' : r.status >= 400 ? 'text-amber-500' : 'text-green-600'}`}>
+                      {r.status || 'ERR'}
+                    </span>
+                    <span className="w-20 text-center text-base-content/60">{r.time}</span>
+                    <div className="flex-1 h-1.5 rounded-full bg-base-200 overflow-hidden">
+                      <div
+                        className={`h-full rounded-full ${r.status === 0 ? 'bg-red-400' : r.status >= 400 ? 'bg-amber-400' : 'bg-green-400'}`}
+                        style={{ width: `${Math.min(100, (parseFloat(r.time) / (parseFloat(concurrentResults[concurrentResults.length - 1]?.time || '1') || 1)) * 100)}%` }}
+                      />
                     </div>
-                    {concurrentResults.map((r) => (
-                      <div key={r.index} className="flex items-center gap-3 px-1 py-1 text-xs hover:bg-base-200/50 rounded">
-                        <span className="w-8 text-center text-base-content/40">{r.index}</span>
-                        <span className={`w-16 text-center font-bold ${r.status === 0 ? 'text-red-500' : r.status >= 400 ? 'text-amber-500' : 'text-green-600'}`}>
-                          {r.status || 'ERR'}
-                        </span>
-                        <span className="w-20 text-center text-base-content/60">{r.time}</span>
-                        <div className="flex-1 h-1.5 rounded-full bg-base-200 overflow-hidden">
-                          <div
-                            className={`h-full rounded-full ${r.status === 0 ? 'bg-red-400' : r.status >= 400 ? 'bg-amber-400' : 'bg-green-400'}`}
-                            style={{ width: `${Math.min(100, (parseFloat(r.time) / (parseFloat(concurrentResults[concurrentResults.length - 1]?.time || '1') || 1)) * 100)}%` }}
-                          />
-                        </div>
-                      </div>
-                    ))}
                   </div>
-                ) : (
-                  <div className="flex h-full items-center justify-center text-xs text-base-content/20 gap-2">
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1"><path d="M12 2a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" /><path d="M16 14a8 8 0 1 0-16 0" /></svg>
-                    <span>开启并发模式后点击「发送」查看并发结果</span>
-                  </div>
-                )
+                ))}
+              </div>
+            ) : response ? (
+              activeResponseTab === 'concurrent' ? (
+                <div className="flex h-full items-center justify-center text-xs text-base-content/20 gap-2">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1"><path d="M12 2a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" /><path d="M16 14a8 8 0 1 0-16 0" /></svg>
+                  <span>开启并发模式后点击「发送」查看并发结果</span>
+                </div>
               ) : activeResponseTab === 'body' ? (
                 <pre className="font-mono text-xs leading-relaxed whitespace-pre-wrap break-all" dangerouslySetInnerHTML={{ __html: highlighters[bodyType](response.body) }} />
               ) : (

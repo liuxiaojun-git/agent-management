@@ -1,5 +1,6 @@
 const defaultApiUrl = '/api/data'
 export const API_URL = import.meta.env.VITE_API_URL || defaultApiUrl
+export const PROXY_API_URL = '/api/proxy'
 
 export interface ApiDataResponse<T = unknown> {
   success: boolean
@@ -13,6 +14,15 @@ async function fetchApi(url: string, action: 'get' | 'set', name: string, data?:
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ action, name, data }),
   })
+}
+
+export async function proxyRequest(targetUrl: string, options: RequestInit) {
+  const res = await fetch(PROXY_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: targetUrl, options }),
+  })
+  return res
 }
 
 export async function apiRequest<T = unknown>(action: 'get' | 'set', name: string, data?: unknown): Promise<ApiDataResponse<T>> {
