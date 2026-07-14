@@ -1,4 +1,6 @@
+import type { ViteDevServer } from 'vite'
+
 export function proxyApiPlugin(): {
   name: string
-  configureServer(server: any): void
+  configureServer(server: ViteDevServer): void
 }
