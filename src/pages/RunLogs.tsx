@@ -60,7 +60,7 @@ export default function RunLogs() {
     if (search) {
       const q = search.toLowerCase()
       const match = (s: string) => s.toLowerCase().includes(q)
-      if (!match(log.id) && !match(log.requestId || '') && !match(log.message) && !match(log.detail) && !match(log.api || '')) return false
+      if (!match(log.id) && !match(log.message) && !match(log.detail) && !match(log.api || '')) return false
     }
     return true
   })
@@ -173,14 +173,12 @@ export default function RunLogs() {
                 <span className="text-base-content/50 shrink-0 w-24">开始时间：</span>
                 <span className="text-base-content">{detailModal.time}</span>
               </div>
-              <div className="flex gap-12 py-3">
-                <span className="text-base-content/50 shrink-0 w-24">Request ID：</span>
-                <span className="text-base-content break-all">{detailModal.requestId || '-'}</span>
-              </div>
-              <div className="flex gap-12 py-3">
-                <span className="text-base-content/50 shrink-0 w-24">Minutes ID：</span>
-                <span className="text-base-content break-all">{detailModal.id || '-'}</span>
-              </div>
+              {detailModal.id && (
+                <div className="flex gap-12 py-3">
+                  <span className="text-base-content/50 shrink-0 w-24">Minutes ID：</span>
+                  <span className="text-base-content break-all">{detailModal.id}</span>
+                </div>
+              )}
               <div className="flex gap-12 py-3">
                 <span className="text-base-content/50 shrink-0 w-24">状态：</span>
                 <span className={detailModal.status === 'failed' ? 'text-error font-medium' : 'text-base-content'}>

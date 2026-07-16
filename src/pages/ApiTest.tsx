@@ -45,10 +45,6 @@ const defaultBody = `{
 
 const nowMs = () => Date.now()
 let nextRequestId = nowMs()
-// 路径分隔符：Windows 用 \，Mac/Linux 用 /
-// 注意：仅转换非 JSON/JS 转义序列的 \，避免破坏 \n \t \\ 等合法转义
-const isWin = navigator.platform?.toLowerCase().includes('win')
-const normalizePathSep = (s: string) => isWin ? s : s.replace(/\\(?!['"\\/bfnrtu])/g, '/')
 
 const bodyTypeMeta: Record<string, { label: string; badge: string; mime: string; color: string; icon: string }> = {
   json:       { label: 'JSON',    badge: 'border-l-green-500 bg-green-50 text-green-700',    mime: 'application/json',                color: 'text-green-600',  icon: '{}' },
@@ -67,7 +63,7 @@ export default function ApiTest() {
   const [activeTab, setActiveTab] = useState<'params' | 'headers' | 'body' | 'auth'>('body')
   const [bodyType, setBodyType] = useState<'json' | 'text' | 'javascript' | 'html' | 'xml'>('json')
   const [headers, setHeaders] = useState<KvPair[]>(hasHistory ? initialList[0].headers.map(h => ({ ...h })) : defaultHeaders.map(h => ({ ...h })))
-  const [body, setBody] = useState(hasHistory ? normalizePathSep(initialList[0].body) : defaultBody)
+  const [body, setBody] = useState(hasHistory ? initialList[0].body : defaultBody)
 
   // 已保存的请求
   const initialCollections = getCollections()
@@ -263,7 +259,7 @@ export default function ApiTest() {
         setMethod(first.method as HttpMethod)
         setUrl(first.url)
         setHeaders(first.headers.map(h => ({ ...h })))
-        setBody(normalizePathSep(first.body))
+        setBody(first.body)
         setResponse(first.lastResponse || null)
         setConcurrentMode(first.concurrentConfig?.mode ?? false)
         setConcurrentCount(first.concurrentConfig?.count ?? 5)
@@ -762,7 +758,7 @@ export default function ApiTest() {
     setMethod(r.method as HttpMethod)
     setUrl(r.url)
     setHeaders(r.headers.map(h => ({ ...h })))
-    setBody(normalizePathSep(r.body))
+    setBody(r.body)
     setCurrentSavedId(r.id)
     setResponse(r.lastResponse ? { ...r.lastResponse } : null)
     setConcurrentResults(r.concurrentResults || null)
@@ -804,11 +800,6 @@ export default function ApiTest() {
   }
 
   // 语法高亮
-  // 高亮字符串中的转义序列（如 \n \t \\ \' \" 等）
-  const hlEsc = (s: string, parentClass: string) =>
-    s.replace(/(\\[\\'"btnfr0]|\\u[\da-fA-F]{4}|\\x[\da-fA-F]{2})/g,
-      `</span><span class="text-fuchsia-400">$1</span><span class="${parentClass}">`)
-
   const escapeHtml = (s: unknown) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
   const highlighters = useMemo(() => ({
@@ -818,11 +809,11 @@ export default function ApiTest() {
       return formatted.replace(
         /("(?:\\.|[^"\\])*")\s*:|\b(true|false)\b|\b(null)\b|(-?\d+\.?\d*(?:[eE][+-]?\d+)?)|("(?:\\.|[^"\\])*")/g,
         ($0: string, key: string, bool: string, nul: string, num: string, str: string) => {
-          if (key) return `<span class="text-blue-400">${hlEsc(escapeHtml(key), 'text-blue-400')}</span><span class="text-gray-400">:</span>`
-          if (bool) return `<span class="text-indigo-400">${bool}</span>`
-          if (nul) return `<span class="text-indigo-400">null</span>`
-          if (num) return `<span class="text-emerald-400">${num}</span>`
-          if (str) return `<span class="text-orange-400">${hlEsc(escapeHtml(str), 'text-orange-400')}</span>`
+          if (key) return `<span style="color:#60a5fa">${escapeHtml(key)}</span><span style="color:#9ca3af">:</span>`
+          if (bool) return `<span style="color:#818cf8">${bool}</span>`
+          if (nul) return `<span style="color:#818cf8">null</span>`
+          if (num) return `<span style="color:#34d399">${num}</span>`
+          if (str) return `<span style="color:#fb923c">${escapeHtml(str)}</span>`
           return escapeHtml($0)
         }
       )
@@ -832,18 +823,9 @@ export default function ApiTest() {
       const escaped = escapeHtml(text)
       let s = escaped.replace(/\/\*[\s\S]*?\*\//g, '<span class="text-green-500 italic">$&</span>')
       s = s.replace(/(\/\/.*)$/gm, '<span class="text-green-500 italic">$1</span>')
-      s = s.replace(/`(?:[^`\\]|\\.)*`/g, ($0) => {
-        const inner = $0.slice(1, -1)
-        return `<span class="text-amber-600">${hlEsc(inner, 'text-amber-600')}</span>`
-      })
-      s = s.replace(/"([^"\\]|\\.)*"/g, ($0) => {
-        const inner = $0.slice(1, -1)
-        return `<span class="text-green-600">${hlEsc(inner, 'text-green-600')}</span>`
-      })
-      s = s.replace(/'([^'\\]|\\.)*'/g, ($0) => {
-        const inner = $0.slice(1, -1)
-        return `<span class="text-green-600">${hlEsc(inner, 'text-green-600')}</span>`
-      })
+      s = s.replace(/`(?:[^`\\]|\\.)*`/g, '<span class="text-amber-600">$&</span>')
+      s = s.replace(/"([^"\\]|\\.)*"/g, '<span class="text-green-600">$&</span>')
+      s = s.replace(/'([^'\\]|\\.)*'/g, '<span class="text-green-600">$&</span>')
       s = s.replace(/\b(\d+\.?\d*(?:[eE][+-]?\d+)?)\b/g, '<span class="text-orange-500">$1</span>')
       const keywords = /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|class|import|export|from|async|await|try|catch|finally|throw|new|delete|typeof|instanceof|this|super|extends|yield|of|in|with|default|static|get|set)\b/g
       s = s.replace(keywords, '<span class="text-blue-600 font-medium">$1</span>')
@@ -902,51 +884,30 @@ export default function ApiTest() {
   const removeHeader = (i: number) => setHeaders(headers.filter((_, idx) => idx !== i))
 
   const prevType = useRef(bodyType)
-  const forceHighlightRef = useRef(false)
-  const undoStack = useRef<string[]>([])
-  const redoStack = useRef<string[]>([])
-  const undoingRef = useRef(false)
-  const pastingRef = useRef(false)
   useEffect(() => {
     if (bodyRef.current) {
       const typeChanged = prevType.current !== bodyType
       prevType.current = bodyType
-      const force = forceHighlightRef.current
-      forceHighlightRef.current = false
-      if (force || typeChanged || bodyRef.current.textContent !== body) {
+      if (typeChanged || bodyRef.current.textContent !== body) {
+        // 光标位置
         const sel = window.getSelection()
         const hadFocus = document.activeElement === bodyRef.current
-        // 保存光标在全文中的字符偏移位置
-        let cursorOffset = -1
+        let startOffset = 0
         if (hadFocus && sel && sel.rangeCount > 0) {
           const range = sel.getRangeAt(0)
           if (bodyRef.current.contains(range.startContainer)) {
-            const preRange = document.createRange()
-            preRange.selectNodeContents(bodyRef.current)
-            preRange.setEnd(range.startContainer, range.startOffset)
-            cursorOffset = preRange.toString().length
+            startOffset = range.startOffset
           }
         }
         bodyRef.current.innerHTML = highlighters[bodyType](body) || ''
-        // 恢复光标到之前的偏移位置
-        if (hadFocus && cursorOffset >= 0) {
+        // 恢复光标
+        if (hadFocus) {
           bodyRef.current.focus()
           const newRange = document.createRange()
-          let charCount = 0
-          const walker = document.createTreeWalker(bodyRef.current, NodeFilter.SHOW_TEXT, null)
-          let node: Text | null
-          while ((node = walker.nextNode() as Text | null)) {
-            const len = node.textContent?.length || 0
-            if (charCount + len >= cursorOffset) {
-              newRange.setStart(node, cursorOffset - charCount)
-              newRange.collapse(true)
-              break
-            }
-            charCount += len
-          }
-          if (!newRange.startContainer) {
-            newRange.selectNodeContents(bodyRef.current)
-            newRange.collapse(false)
+          newRange.selectNodeContents(bodyRef.current)
+          newRange.collapse(false) // 末尾
+          if (startOffset > 0 && bodyRef.current.firstChild) {
+            try { newRange.setStart(bodyRef.current.firstChild, Math.min(startOffset, bodyRef.current.textContent?.length || 0)) } catch { /* 忽略光标越界 */ }
           }
           sel?.removeAllRanges()
           sel?.addRange(newRange)
@@ -954,58 +915,6 @@ export default function ApiTest() {
       }
     }
   }, [body, bodyType, activeTab, highlighters])
-
-  // 原生捕获阶段处理粘贴，在 React 合成事件之前拦截
-  const bodyRefForUndo = useRef(body)
-  bodyRefForUndo.current = body
-  useEffect(() => {
-    const el = bodyRef.current
-    if (!el) return
-    const onNativePaste = (e: ClipboardEvent) => {
-      e.preventDefault()
-      e.stopPropagation()
-      pastingRef.current = true
-      const currentBody = bodyRefForUndo.current
-      undoStack.current.push(currentBody)
-      if (undoStack.current.length > 50) undoStack.current.shift()
-      redoStack.current = []
-      const rawText = e.clipboardData?.getData('text/plain') || ''
-      let pasteText: string
-      // 先检测是否为 JSON，JSON 有自身转义规则，不转换路径分隔符
-      const trimmed = rawText.trim()
-      const isJson = (trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))
-      if (isJson) {
-        try {
-          pasteText = JSON.stringify(JSON.parse(trimmed), null, 2)
-          setBodyType('json')
-        } catch { pasteText = normalizePathSep(rawText) }
-      } else {
-        pasteText = normalizePathSep(rawText)
-      }
-      const fullText = el.textContent || ''
-      const gsel = window.getSelection()
-      if (gsel && gsel.rangeCount > 0 && el.contains(gsel.getRangeAt(0).commonAncestorContainer)) {
-        const range = gsel.getRangeAt(0)
-        const r1 = document.createRange()
-        r1.selectNodeContents(el)
-        r1.setEnd(range.startContainer, range.startOffset)
-        const start = r1.toString().length
-        const r2 = document.createRange()
-        r2.selectNodeContents(el)
-        r2.setEnd(range.endContainer, range.endOffset)
-        const end = r2.toString().length
-        const newText = fullText.slice(0, start) + pasteText + fullText.slice(end)
-        forceHighlightRef.current = true
-        setBody(newText)
-      } else {
-        forceHighlightRef.current = true
-        setBody(fullText + pasteText)
-      }
-      pastingRef.current = false
-    }
-    el.addEventListener('paste', onNativePaste, true)
-    return () => el.removeEventListener('paste', onNativePaste, true)
-  }, [])
 
   // 按集合分组
   const grouped = collections.map(c => ({
@@ -1366,55 +1275,19 @@ export default function ApiTest() {
                 className="textarea textarea-bordered w-full min-h-50 p-4 whitespace-pre-wrap break-all text-sm leading-6 overflow-auto font-mono focus:outline-none"
                 contentEditable
                 suppressContentEditableWarning
-                onInput={(e) => {
-                  if (pastingRef.current) return
-                  if (!undoingRef.current) {
-                    undoStack.current.push(body)
-                    if (undoStack.current.length > 50) undoStack.current.shift()
-                    redoStack.current = []
-                  }
-                  forceHighlightRef.current = true
-                  setBody((e.target as HTMLElement).textContent || '')
-                }}
-                onKeyDown={(e) => {
-                  if (!isWin && e.key === '\\') {
-                    e.preventDefault()
-                    const gsel = window.getSelection()
-                    if (gsel && gsel.rangeCount > 0) {
-                      const range = gsel.getRangeAt(0)
-                      range.deleteContents()
-                      range.insertNode(document.createTextNode('/'))
-                      range.collapse(false)
-                      forceHighlightRef.current = true
-                      setBody(bodyRef.current?.textContent || '')
-                    }
-                    return
-                  }
-                  if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
-                    e.preventDefault()
-                    if (undoStack.current.length > 0) {
-                      redoStack.current.push(body)
-                      const prev = undoStack.current.pop()!
-                      undoingRef.current = true
-                      forceHighlightRef.current = true
-                      setBody(prev)
-                      setTimeout(() => { undoingRef.current = false }, 0)
-                    }
-                  }
-                  if (((e.ctrlKey || e.metaKey) && e.key === 'y') || ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'z')) {
-                    e.preventDefault()
-                    if (redoStack.current.length > 0) {
-                      undoStack.current.push(body)
-                      const next = redoStack.current.pop()!
-                      undoingRef.current = true
-                      forceHighlightRef.current = true
-                      setBody(next)
-                      setTimeout(() => { undoingRef.current = false }, 0)
-                    }
-                  }
-                }}
+                onInput={(e) => setBody((e.target as HTMLElement).textContent || '')}
                 onScroll={syncBodyScroll}
-                onPaste={() => {}} // 占位，实际在原生捕获事件中处理
+                onPaste={(e) => {
+                  e.preventDefault()
+                  const text = e.clipboardData.getData('text/plain')
+                  // 自动识别 JSON 并切换 body 类型
+                  const trimmed = text.trim()
+                  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                    try { JSON.parse(trimmed); setBodyType('json') } catch { /* 非 JSON 内容忽略 */ }
+                  }
+                  // 直接设置 body 状态，由 useEffect 同步更新 DOM 和高亮
+                  setBody(text)
+                }}
                 data-placeholder={`输入 ${bodyTypeMeta[bodyType].label}...`}
               />
             </div>

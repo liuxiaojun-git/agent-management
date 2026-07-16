@@ -59,28 +59,19 @@ function localStorageFallback(): SavedRequestStore {
   }
 }
 
-// 缓存 fetchFromFile 调用，避免重复请求
-let fetchPromise: Promise<SavedRequestStore> | null = null
 async function fetchFromFile(): Promise<SavedRequestStore> {
-  if (!fetchPromise) {
-    fetchPromise = (async () => {
-      try {
-        const result = await apiRequest<SavedRequestStore | SavedRequest[]>('get', NAME)
-        if (result.success && result.data != null) {
-          if (Array.isArray(result.data)) {
-            return { collections: DEFAULT_COLLECTIONS, requests: result.data, collapsedCollections: {} }
-          }
-          return {
-            collections: Array.isArray(result.data.collections) && result.data.collections.length > 0 ? result.data.collections : DEFAULT_COLLECTIONS,
-            requests: Array.isArray(result.data.requests) ? result.data.requests : [],
-            collapsedCollections: typeof result.data.collapsedCollections === 'object' && result.data.collapsedCollections !== null ? result.data.collapsedCollections : {},
-          }
-        }
-      } catch { /* ignore */ }
-      return { collections: DEFAULT_COLLECTIONS, requests: [], collapsedCollections: {} }
-    })()
+  const result = await apiRequest<SavedRequestStore | SavedRequest[]>('get', NAME)
+  if (!result.success || result.data == null) {
+    return { collections: DEFAULT_COLLECTIONS, requests: [], collapsedCollections: {} }
   }
-  return fetchPromise
+  if (Array.isArray(result.data)) {
+    return { collections: DEFAULT_COLLECTIONS, requests: result.data, collapsedCollections: {} }
+  }
+  return {
+    collections: Array.isArray(result.data.collections) && result.data.collections.length > 0 ? result.data.collections : DEFAULT_COLLECTIONS,
+    requests: Array.isArray(result.data.requests) ? result.data.requests : [],
+    collapsedCollections: typeof result.data.collapsedCollections === 'object' && result.data.collapsedCollections !== null ? result.data.collapsedCollections : {},
+  }
 }
 
 async function writeToFile(data: SavedRequestStore) {
@@ -130,8 +121,6 @@ export async function hydrateStoreFromFile(): Promise<SavedRequestStore> {
 // 同步更新并异步持久化
 export function setSavedRequests(data: SavedRequest[]) {
   const current = getCacheData()
-  // 数据未变时跳过持久化
-  if (JSON.stringify(current.requests) === JSON.stringify(data)) return
   current.requests = data
   cache = current
   syncToLocal(current) // 同步写入 localStorage 保证跨页面恢复

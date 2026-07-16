@@ -1,9 +1,9 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-// @ts-expect-error .mjs file has no type declarations
+// @ts-ignore .mjs file has no type declarations
 import { dataApiPlugin } from './server/api.mjs'
-// @ts-expect-error .mjs 声明文件 IDE 未能识别
+// @ts-ignore .mjs file has no type declarations
 import { proxyApiPlugin } from './server/proxyApi.mjs'
 
 // https://vite.dev/config/

@@ -1,7 +1,6 @@
 // 侧边栏导航 — 主导航菜单，包含首页、API 测试、日志、模型管理等页面入口
-import { NavLink, useNavigate } from 'react-router-dom'
+import { NavLink } from 'react-router-dom'
 import { useState, useEffect } from 'react'
-import LoginSection from './LoginSection'
 
 interface SidebarProps {
   open: boolean
@@ -57,16 +56,20 @@ const menuItems = [
 ]
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
-  const navigate = useNavigate()
-  const [user, setUser] = useState<{ name: string } | null>(() => {
-    const saved = localStorage.getItem('user')
-    return saved ? JSON.parse(saved) : null
-  })
+  const themes = [
+    { id: 'light', label: '明亮', icon: '☀️' },
+    { id: 'dark', label: '暗黑', icon: '🌙' },
+    { id: 'retro', label: '复古', icon: '📻' },
+    { id: 'valentine', label: '情人节', icon: '💕' },
+    { id: 'lemonade', label: '柠檬', icon: '🍋' },
+    { id: 'aqua', label: '海洋', icon: '🌊' },
+  ]
+  const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'light')
 
   useEffect(() => {
-    if (user) localStorage.setItem('user', JSON.stringify(user))
-    else { localStorage.removeItem('user'); navigate('/login', { replace: true }) }
-  }, [user])
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+  }, [theme])
 
   return (
     <aside
@@ -109,13 +112,62 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
         </ul>
       </nav>
 
-      {/* 底部区域 - 用户登录 */}
+      {/* 底部区域 - 已登录 */}
       <div className="absolute bottom-0 left-0 right-0 border-t border-base-200 p-4">
-        <LoginSection
-          user={user}
-          onLogin={(u) => setUser(u)}
-          onLogout={() => setUser(null)}
-        />
+        <div className="dropdown dropdown-top w-full">
+          <button
+            tabIndex={0}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-base-200"
+          >
+            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-content text-sm font-medium">
+              A
+            </div>
+            <div className="flex flex-1 flex-col text-left">
+              <span className="text-sm font-medium text-base-content">admin</span>
+              <span className="text-xs text-base-content/40">管理员</span>
+            </div>
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-base-content/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="6 9 12 15 18 9" />
+            </svg>
+          </button>
+          <ul
+            tabIndex={0}
+            className="menu dropdown-content z-1 mb-2 w-full rounded-box bg-base-100 p-2 shadow-lg"
+          >
+            <li className="divider my-1"></li>
+            <li className="dropdown dropdown-top dropdown-end">
+              <button tabIndex={0} className="flex items-center gap-3 text-sm">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+                </svg>
+                主题切换
+              </button>
+              <ul tabIndex={0} className="dropdown-content menu rounded-box z-1 w-40 bg-base-100 p-2 shadow-lg" style={{ maxHeight: '300px', overflowY: 'auto' }}>
+                {themes.map(t => (
+                  <li key={t.id}>
+                    <button
+                      className={`flex items-center gap-2 text-sm ${theme === t.id ? 'text-primary font-medium' : ''}`}
+                      onClick={() => setTheme(t.id)}
+                    >
+                      <span>{t.icon}</span> {t.label}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </li>
+            <li className="divider my-1"></li>
+            <li>
+              <button className="flex items-center gap-3 text-sm text-error">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                  <polyline points="16 17 21 12 16 7" />
+                  <line x1="21" y1="12" x2="9" y2="12" />
+                </svg>
+                退出登录
+              </button>
+            </li>
+          </ul>
+        </div>
       </div>
     </aside>
   )

@@ -9,7 +9,6 @@ export interface LogEntry {
   detail: string
   timestamp: number
   category?: 'operation' | 'audit'
-  requestId?: string
   status?: 'success' | 'failed'
   duration?: string
   tokens?: number
@@ -20,21 +19,10 @@ export interface LogEntry {
 
 const fileName = (cat: string) => cat === 'audit' ? 'app-logs-run' : 'app-logs-operation'
 
-// 日志缓存：重复请求直接返回缓存结果
-// 使用 Promise 缓存避免并发重复请求
-const logCache = new Map<string, LogEntry[] | Promise<LogEntry[]>>()
 export async function getLogs(cat?: string): Promise<LogEntry[]> {
   if (cat) {
-    const cached = logCache.get(cat)
-    if (cached instanceof Promise) return cached
-    if (Array.isArray(cached)) return cached
-    const promise = apiRequest<LogEntry[]>('get', fileName(cat)).then(result => {
-      const data = result.success ? (result.data || []) : []
-      logCache.set(cat, data)
-      return data
-    })
-    logCache.set(cat, promise)
-    return promise
+    const result = await apiRequest<LogEntry[]>('get', fileName(cat))
+    return result.success ? (result.data || []) : []
   }
   // 读取两个文件合并
   const [op, au] = await Promise.all([
@@ -46,15 +34,8 @@ export async function getLogs(cat?: string): Promise<LogEntry[]> {
   return all
 }
 
-// 清除日志缓存（新增日志后调用）
-export function clearLogCache(cat?: string) {
-  if (cat) logCache.delete(cat)
-  else logCache.clear()
-}
-
 export async function addLog(log: Omit<LogEntry, 'id' | 'timestamp'>): Promise<LogEntry | null> {
   const cat = log.category || 'operation'
-  clearLogCache(cat)
   const current = await getLogs(cat)
   const entry: LogEntry = {
     ...log,
@@ -62,7 +43,6 @@ export async function addLog(log: Omit<LogEntry, 'id' | 'timestamp'>): Promise<L
     timestamp: Date.now(),
   }
   current.unshift(entry)
-  logCache.set(cat, current)
   const result = await apiRequest('set', fileName(cat), current.slice(0, 500))
   return result.success ? entry : null
 }
