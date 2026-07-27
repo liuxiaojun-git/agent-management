@@ -1,7 +1,12 @@
 version: '3.9'
 services:
   frontend:
-    build: .
+    # 显式指定构建上下文和 Dockerfile 路径，结构更清晰
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agent-management:v1.0.0 # 顺便指定镜像名称和版本，方便后续管理
+    container_name: agent-management-frontend # 给容器起个固定的名字
     ports:
       - '80:80'
     restart: unless-stopped

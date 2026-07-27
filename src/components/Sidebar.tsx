@@ -3,6 +3,10 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import { useState, useEffect } from 'react'
 import LoginSection from './LoginSection'
 
+interface User {
+  name: string
+}
+
 interface SidebarProps {
   open: boolean
   onClose: () => void
@@ -56,17 +60,29 @@ const menuItems = [
   },
 ]
 
+function getStoredUser(): User | null {
+  try {
+    const saved = localStorage.getItem('user')
+    return saved ? JSON.parse(saved) as User : null
+  } catch {
+    localStorage.removeItem('user')
+    return null
+  }
+}
+
 export default function Sidebar({ open, onClose }: SidebarProps) {
   const navigate = useNavigate()
-  const [user, setUser] = useState<{ name: string } | null>(() => {
-    const saved = localStorage.getItem('user')
-    return saved ? JSON.parse(saved) : null
-  })
+  const [user, setUser] = useState<User | null>(getStoredUser)
 
   useEffect(() => {
-    if (user) localStorage.setItem('user', JSON.stringify(user))
-    else { localStorage.removeItem('user'); navigate('/login', { replace: true }) }
-  }, [user])
+    if (user) {
+      localStorage.setItem('user', JSON.stringify(user))
+      return
+    }
+
+    localStorage.removeItem('user')
+    navigate('/login', { replace: true })
+  }, [navigate, user])
 
   return (
     <aside

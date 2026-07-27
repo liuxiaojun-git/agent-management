@@ -4,7 +4,17 @@ import { flushSync } from 'react-dom'
 import { addLog } from '../utils/logStore'
 import { createRequestGuard } from '../utils/requestGuard.ts'
 import { proxyRequest } from '../utils/api'
-import { getSavedRequests, getCollections, getCollapsedCollections, setSavedRequests as storeSaveRequests, setCollections as storeSetCollections, setCollapsedCollections as storeSetCollapsedCollections, hydrateStoreFromFile, type SavedRequest, type Collection } from '../utils/requestStore'
+import {
+  getSavedRequests,
+  getCollections,
+  getCollapsedCollections,
+  setSavedRequests as storeSaveRequests,
+  setCollections as storeSetCollections,
+  setCollapsedCollections as storeSetCollapsedCollections,
+  hydrateStoreFromFile,
+  type SavedRequest,
+  type Collection,
+} from '../utils/requestStore'
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
@@ -67,7 +77,9 @@ export default function ApiTest() {
   const [activeTab, setActiveTab] = useState<'params' | 'headers' | 'body' | 'auth'>('body')
   const [bodyType, setBodyType] = useState<'json' | 'text' | 'javascript' | 'html' | 'xml'>('json')
   const [headers, setHeaders] = useState<KvPair[]>(hasHistory ? initialList[0].headers.map(h => ({ ...h })) : defaultHeaders.map(h => ({ ...h })))
-  const [body, setBody] = useState(hasHistory ? normalizePathSep(initialList[0].body) : defaultBody)
+  const initBody = hasHistory ? normalizePathSep(initialList[0].body) : defaultBody
+  const [body, setBody] = useState(initBody)
+  const [lineCount, setLineCount] = useState(initBody.split('\n').length)
 
   // 已保存的请求
   const initialCollections = getCollections()
@@ -170,7 +182,9 @@ export default function ApiTest() {
   const [renameLabel, setRenameLabel] = useState('')
   // 语法高亮编辑（单层 contentEditable）
   const bodyRef = useRef<HTMLDivElement>(null)
+  const gutterRef = useRef<HTMLDivElement>(null)
   const syncBodyScroll = () => {}
+  const [wrapBody, setWrapBody] = useState(true)
   // 响应面板高度拖拽
   const [responseHeight, setResponseHeight] = useState(Math.min(400, window.innerHeight * 0.35))
   const dragging = useRef(false)
@@ -264,6 +278,7 @@ export default function ApiTest() {
         setUrl(first.url)
         setHeaders(first.headers.map(h => ({ ...h })))
         setBody(normalizePathSep(first.body))
+        setLineCount(first.body.split('\n').length)
         setResponse(first.lastResponse || null)
         setConcurrentMode(first.concurrentConfig?.mode ?? false)
         setConcurrentCount(first.concurrentConfig?.count ?? 5)
@@ -292,10 +307,6 @@ export default function ApiTest() {
     setToast(msg)
     setTimeout(() => setToast(null), 2000)
   }
-
-  useEffect(() => {
-    storeSetCollections(collections)
-  }, [collections])
 
   const isValidCollectionName = (value: string) => /^[\p{L}\p{N}\s_-]+$/u.test(value)
 
@@ -763,6 +774,7 @@ export default function ApiTest() {
     setUrl(r.url)
     setHeaders(r.headers.map(h => ({ ...h })))
     setBody(normalizePathSep(r.body))
+    setLineCount(r.body.split('\n').length)
     setCurrentSavedId(r.id)
     setResponse(r.lastResponse ? { ...r.lastResponse } : null)
     setConcurrentResults(r.concurrentResults || null)
@@ -907,6 +919,7 @@ export default function ApiTest() {
   const redoStack = useRef<string[]>([])
   const undoingRef = useRef(false)
   const pastingRef = useRef(false)
+  const cursorRef = useRef(-1)
   useEffect(() => {
     if (bodyRef.current) {
       const typeChanged = prevType.current !== bodyType
@@ -917,17 +930,20 @@ export default function ApiTest() {
         const sel = window.getSelection()
         const hadFocus = document.activeElement === bodyRef.current
         // 保存光标在全文中的字符偏移位置
-        let cursorOffset = -1
-        if (hadFocus && sel && sel.rangeCount > 0) {
+        if (cursorRef.current < 0 && hadFocus && sel && sel.rangeCount > 0) {
           const range = sel.getRangeAt(0)
           if (bodyRef.current.contains(range.startContainer)) {
             const preRange = document.createRange()
             preRange.selectNodeContents(bodyRef.current)
             preRange.setEnd(range.startContainer, range.startOffset)
-            cursorOffset = preRange.toString().length
+            cursorRef.current = preRange.toString().length
           }
         }
+        const cursorOffset = cursorRef.current
+        cursorRef.current = -1
         bodyRef.current.innerHTML = highlighters[bodyType](body) || ''
+        // 从 DOM 同步行数
+        setLineCount((bodyRef.current.textContent || '').split('\n').length)
         // 恢复光标到之前的偏移位置
         if (hadFocus && cursorOffset >= 0) {
           bodyRef.current.focus()
@@ -1341,42 +1357,88 @@ export default function ApiTest() {
 
           {activeTab === 'body' && (
             <div className="p-4 pt-0">
-              <div className="sticky top-0 z-10 flex min-w-0 items-center gap-2 bg-base-100 pb-3 pt-4">
-                {/* 类型选择器 */}
-                <div className="dropdown">
-                  <button tabIndex={0} className={`inline-flex items-center gap-1 rounded-md border-l-[3px] px-2 py-1 text-xs font-medium transition-colors ${bodyTypeMeta[bodyType].badge}`}>
-                    {bodyTypeMeta[bodyType].icon} {bodyTypeMeta[bodyType].label}
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 opacity-50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9" /></svg>
-                  </button>
-                  <ul tabIndex={0} className="menu dropdown-content z-1 mt-1 w-36 rounded-box bg-base-100 p-1 shadow-lg">
-                    {Object.entries(bodyTypeMeta).map(([key, meta]) => (
-                      <li key={key}>
-                        <button className={`text-xs ${bodyType === key ? 'font-bold' : ''}`} onClick={() => changeBodyType(key as typeof bodyType)}>
-                          <span className={`inline-flex items-center gap-1 ${meta.color}`}>{meta.icon} {meta.label}</span>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
+              {/* 代码块头部 */}
+              <div className="flex items-center justify-between rounded-t-lg border border-b-0 border-base-300 bg-base-200/50 px-4 py-2">
+                <div className="flex items-center gap-2">
+                  <div className="dropdown">
+                    <button tabIndex={0} className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-xs font-medium ${bodyTypeMeta[bodyType].badge}`}>
+                      {bodyTypeMeta[bodyType].icon} {bodyTypeMeta[bodyType].label}
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 opacity-50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 12 15 18 9" /></svg>
+                    </button>
+                    <ul tabIndex={0} className="menu dropdown-content z-1 mt-1 w-36 rounded-box bg-base-100 p-1 shadow-lg">
+                      {Object.entries(bodyTypeMeta).map(([key, meta]) => (
+                        <li key={key}>
+                          <button className={`text-xs ${bodyType === key ? 'font-bold' : ''}`} onClick={() => changeBodyType(key as typeof bodyType)}>
+                            <span className={`inline-flex items-center gap-1 ${meta.color}`}>{meta.icon} {meta.label}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  <span className="text-xs text-base-content/30">·</span>
+                  <span className="text-xs text-base-content/50">{bodyTypeMeta[bodyType].mime}</span>
                 </div>
-                <span className="shrink-0 text-xs text-base-content/30">·</span>
-                <span className="min-w-0 shrink-0 text-xs text-base-content/50">Content-Type: {bodyTypeMeta[bodyType].mime}</span>
+                <div className="flex items-center gap-1">
+                  <button className="btn btn-ghost btn-xs text-base-content/40 hover:text-base-content gap-1" onClick={() => setWrapBody(!wrapBody)} title={wrapBody ? '取消自动换行' : '自动换行'}>
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12H7" /><path d="M11 18l-4-4 4-4" /><path d="M21 6H3" /></svg>
+                    {wrapBody ? '自动换行' : '横向滚动'}
+                  </button>
+                  <button className="btn btn-ghost btn-xs text-base-content/40 hover:text-base-content gap-1" onClick={() => {
+                    navigator.clipboard.writeText(body)
+                    showToast('✅ 已复制')
+                  }}>
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+                    复制
+                  </button>
+                </div>
               </div>
-              <div
+              <div className="flex border border-base-300 rounded-b-lg overflow-hidden bg-base-100">
+                <div className="shrink-0 select-none text-right text-xs leading-6 py-4 px-1 text-base-content/20 bg-base-200/30 font-mono w-12 overflow-hidden" ref={gutterRef}>
+                  {Array.from({ length: lineCount }, (_, i) => (
+                    <div key={i} className="pr-1">{i + 1}</div>
+                  ))}
+                </div>
+                <div className="flex-1 min-w-0">
+                <div
                 ref={bodyRef}
-                className="textarea textarea-bordered w-full min-h-50 p-4 whitespace-pre-wrap break-all text-sm leading-6 overflow-auto font-mono focus:outline-none"
+                className={`w-full min-h-50 p-4 text-sm leading-6 overflow-auto font-mono focus:outline-none ${wrapBody ? 'whitespace-pre-wrap break-all' : 'whitespace-pre overflow-x-auto'}`}
                 contentEditable
                 suppressContentEditableWarning
                 onInput={(e) => {
                   if (pastingRef.current) return
+                  const gsel = window.getSelection()
+                  if (gsel && gsel.rangeCount > 0 && bodyRef.current?.contains(gsel.getRangeAt(0).commonAncestorContainer)) {
+                    const pre = document.createRange()
+                    pre.selectNodeContents(bodyRef.current)
+                    pre.setEnd(gsel.getRangeAt(0).startContainer, gsel.getRangeAt(0).startOffset)
+                    cursorRef.current = pre.toString().length
+                  }
                   if (!undoingRef.current) {
                     undoStack.current.push(body)
                     if (undoStack.current.length > 50) undoStack.current.shift()
                     redoStack.current = []
                   }
                   forceHighlightRef.current = true
-                  setBody((e.target as HTMLElement).textContent || '')
+                  const txt = (e.target as HTMLElement).textContent || ''
+                  setBody(txt)
+                  setLineCount(txt.split('\n').length)
                 }}
                 onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    const gsel = window.getSelection()
+                    if (gsel && gsel.rangeCount > 0) {
+                      const range = gsel.getRangeAt(0)
+                      range.deleteContents()
+                      range.insertNode(document.createTextNode('\n'))
+                      range.collapse(false)
+                      const txt = bodyRef.current?.textContent || ''
+                      setBody(txt)
+                      setLineCount(txt.split('\n').length)
+                      forceHighlightRef.current = true
+                    }
+                    return
+                  }
                   if (!isWin && e.key === '\\') {
                     e.preventDefault()
                     const gsel = window.getSelection()
@@ -1418,6 +1480,8 @@ export default function ApiTest() {
                 data-placeholder={`输入 ${bodyTypeMeta[bodyType].label}...`}
               />
             </div>
+          </div>
+          </div>
           )}
 
           {activeTab === 'params' && (
@@ -1529,7 +1593,28 @@ export default function ApiTest() {
                   <span>开启并发模式后点击「发送」查看并发结果</span>
                 </div>
               ) : activeResponseTab === 'body' ? (
-                <pre className="font-mono text-xs leading-relaxed whitespace-pre-wrap break-all" dangerouslySetInnerHTML={{ __html: highlighters[bodyType](response.body) }} />
+                <div className="flex flex-col h-full">
+                  <div className="flex items-center justify-between rounded-t-lg border border-b-0 border-base-200 bg-base-200/50 px-4 py-1.5 shrink-0">
+                    <span className="text-xs text-base-content/50">{bodyTypeMeta[bodyType].mime}</span>
+                    <button className="btn btn-ghost btn-xs text-base-content/40 hover:text-base-content gap-1" onClick={() => {
+                      navigator.clipboard.writeText(response.body)
+                      showToast('✅ 已复制')
+                    }}>
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+                      复制
+                    </button>
+                  </div>
+                  <div className="flex border border-base-200 rounded-b-lg overflow-hidden bg-base-100 flex-1">
+                    <div className="shrink-0 select-none text-right text-xs leading-5 py-3 px-1 text-base-content/20 bg-base-200/30 font-mono w-12">
+                      {response.body.split('\n').map((_, i) => (
+                        <div key={i} className="pr-1">{i + 1}</div>
+                      ))}
+                    </div>
+                    <div className="flex-1 overflow-auto">
+                      <pre className="font-mono text-xs leading-5 whitespace-pre-wrap break-all p-3 m-0" dangerouslySetInnerHTML={{ __html: highlighters[bodyType](response.body) }} />
+                    </div>
+                  </div>
+                </div>
               ) : (
                 <div className="flex flex-col gap-1">
                   {Object.entries(response.headers).map(([k, v]) => (

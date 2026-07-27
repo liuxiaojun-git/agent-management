@@ -1,3 +1,5 @@
+import { apiRequest } from './api'
+
 export interface SavedRequest {
   id: string
   label: string
@@ -16,7 +18,13 @@ export interface SavedRequest {
     headers: Record<string, string>
   }
   concurrentResults?: { index: number; status: number; time: string }[]
-  concurrentSummary?: { total: number; success: number; failed: number; avgTime: string; totalTime: string }
+  concurrentSummary?: {
+    total: number
+    success: number
+    failed: number
+    avgTime: string
+    totalTime: string
+  }
   concurrentConfig?: { mode: boolean; count: number; duration: number; timeout: number }
 }
 
@@ -25,37 +33,51 @@ export interface Collection {
   icon: string
 }
 
-export interface SavedRequestStore {
+interface SavedRequestStore {
   collections: Collection[]
   requests: SavedRequest[]
-  collapsedCollections?: Record<string, boolean>
+  collapsedCollections: Record<string, boolean>
 }
-
-import { apiRequest } from './api'
 
 const NAME = 'api-test-saved-requests'
 const LS_KEY = 'api-test-saved-requests'
-const DEFAULT_COLLECTIONS: Collection[] = [
-  { name: '默认集合', icon: '📁' },
-]
+const DEFAULT_COLLECTIONS: Collection[] = [{ name: '默认集合', icon: '📁' }]
+const EMPTY_STORE: SavedRequestStore = {
+  collections: DEFAULT_COLLECTIONS,
+  requests: [],
+  collapsedCollections: {},
+}
+
 let cache: SavedRequestStore | null = null
+
+function normalizeStore(data: unknown): SavedRequestStore {
+  if (Array.isArray(data)) {
+    return { ...EMPTY_STORE, requests: data as SavedRequest[] }
+  }
+
+  if (!data || typeof data !== 'object') return { ...EMPTY_STORE }
+
+  const store = data as Partial<SavedRequestStore>
+  return {
+    collections:
+      Array.isArray(store.collections) && store.collections.length > 0
+        ? store.collections
+        : DEFAULT_COLLECTIONS,
+    requests: Array.isArray(store.requests) ? store.requests : [],
+    collapsedCollections:
+      store.collapsedCollections && typeof store.collapsedCollections === 'object'
+        ? store.collapsedCollections
+        : {},
+  }
+}
 
 // 从 localStorage 同步恢复（保证首次渲染就有数据）
 function localStorageFallback(): SavedRequestStore {
   try {
     const raw = localStorage.getItem(LS_KEY)
-    if (!raw) return { collections: DEFAULT_COLLECTIONS, requests: [], collapsedCollections: {} }
-    const parsed = JSON.parse(raw)
-    if (Array.isArray(parsed)) {
-      return { collections: DEFAULT_COLLECTIONS, requests: parsed, collapsedCollections: {} }
-    }
-    return {
-      collections: Array.isArray(parsed.collections) && parsed.collections.length > 0 ? parsed.collections : DEFAULT_COLLECTIONS,
-      requests: Array.isArray(parsed.requests) ? parsed.requests : [],
-      collapsedCollections: typeof parsed.collapsedCollections === 'object' && parsed.collapsedCollections !== null ? parsed.collapsedCollections : {},
-    }
+    return raw ? normalizeStore(JSON.parse(raw)) : { ...EMPTY_STORE }
   } catch {
-    return { collections: DEFAULT_COLLECTIONS, requests: [], collapsedCollections: {} }
+    return { ...EMPTY_STORE }
   }
 }
 
@@ -67,41 +89,51 @@ async function fetchFromFile(): Promise<SavedRequestStore> {
       try {
         const result = await apiRequest<SavedRequestStore | SavedRequest[]>('get', NAME)
         if (result.success && result.data != null) {
-          if (Array.isArray(result.data)) {
-            return { collections: DEFAULT_COLLECTIONS, requests: result.data, collapsedCollections: {} }
-          }
-          return {
-            collections: Array.isArray(result.data.collections) && result.data.collections.length > 0 ? result.data.collections : DEFAULT_COLLECTIONS,
-            requests: Array.isArray(result.data.requests) ? result.data.requests : [],
-            collapsedCollections: typeof result.data.collapsedCollections === 'object' && result.data.collapsedCollections !== null ? result.data.collapsedCollections : {},
-          }
+          return normalizeStore(result.data)
         }
-      } catch { /* ignore */ }
-      return { collections: DEFAULT_COLLECTIONS, requests: [], collapsedCollections: {} }
+      } catch {
+        // 服务端不可用时继续使用本地缓存。
+      }
+      return { ...EMPTY_STORE }
     })()
   }
   return fetchPromise
 }
 
-async function writeToFile(data: SavedRequestStore) {
-  await apiRequest('set', NAME, data)
-}
-
 // 同步写入 localStorage（保证页面刷新后仍能恢复）
 function syncToLocal(data: SavedRequestStore) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(data)) } catch { /* ignore */ }
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(data))
+  } catch {
+    // 浏览器禁用存储时仍允许页面继续工作。
+  }
 }
 
 let flushTimer: ReturnType<typeof setTimeout> | null = null
-let synced = false
 
 function getCacheData(): SavedRequestStore {
   if (!cache) cache = localStorageFallback()
   return cache
 }
 
+function updateStore(update: Partial<SavedRequestStore>) {
+  const current = getCacheData()
+  const next = { ...current, ...update }
+
+  if (JSON.stringify(current) === JSON.stringify(next)) return
+
+  cache = next
+  syncToLocal(next)
+
+  if (flushTimer) clearTimeout(flushTimer)
+  flushTimer = setTimeout(() => {
+    void apiRequest('set', NAME, next)
+    flushTimer = null
+  }, 300)
+}
+
 export function getCollapsedCollections(): Record<string, boolean> {
-  return getCacheData().collapsedCollections || {}
+  return getCacheData().collapsedCollections
 }
 
 // 同步读取（首次调用后缓存）
@@ -115,12 +147,11 @@ export function getCollections(): Collection[] {
 
 export async function hydrateStoreFromFile(): Promise<SavedRequestStore> {
   const fileData = await fetchFromFile()
+  const localData = getCacheData()
   const normalized: SavedRequestStore = {
-    collections: Array.isArray(fileData.collections) && fileData.collections.length > 0 ? fileData.collections : getCacheData().collections,
-    requests: Array.isArray(fileData.requests) ? fileData.requests : [],
-    collapsedCollections: typeof fileData.collapsedCollections === 'object' && fileData.collapsedCollections !== null
-      ? fileData.collapsedCollections
-      : getCacheData().collapsedCollections || {},
+    collections: fileData.collections.length > 0 ? fileData.collections : localData.collections,
+    requests: fileData.requests.length > 0 ? fileData.requests : localData.requests,
+    collapsedCollections: fileData.collapsedCollections,
   }
   cache = normalized
   syncToLocal(normalized)
@@ -129,54 +160,13 @@ export async function hydrateStoreFromFile(): Promise<SavedRequestStore> {
 
 // 同步更新并异步持久化
 export function setSavedRequests(data: SavedRequest[]) {
-  const current = getCacheData()
-  // 数据未变时跳过持久化
-  if (JSON.stringify(current.requests) === JSON.stringify(data)) return
-  current.requests = data
-  cache = current
-  syncToLocal(current) // 同步写入 localStorage 保证跨页面恢复
-  if (flushTimer) clearTimeout(flushTimer)
-  flushTimer = setTimeout(() => {
-    writeToFile(current)
-    flushTimer = null
-  }, 300)
-
-  if (!synced) {
-    synced = true
-    fetchFromFile().then(fileData => {
-      const currentJson = JSON.stringify(current)
-      const fileJson = JSON.stringify(fileData)
-      if (fileJson !== currentJson) {
-        cache = fileData
-        writeToFile(fileData)
-        try { localStorage.setItem(LS_KEY, JSON.stringify(fileData)) } catch { /* ignore */ }
-      } else if (current.requests.length > 0 && fileData.requests.length === 0) {
-        writeToFile(current)
-      }
-    })
-  }
+  updateStore({ requests: data })
 }
 
 export function setCollections(data: Collection[]) {
-  const current = getCacheData()
-  current.collections = data
-  cache = current
-  syncToLocal(current)
-  if (flushTimer) clearTimeout(flushTimer)
-  flushTimer = setTimeout(() => {
-    writeToFile(current)
-    flushTimer = null
-  }, 300)
+  updateStore({ collections: data })
 }
 
 export function setCollapsedCollections(data: Record<string, boolean>) {
-  const current = getCacheData()
-  current.collapsedCollections = data
-  cache = current
-  syncToLocal(current)
-  if (flushTimer) clearTimeout(flushTimer)
-  flushTimer = setTimeout(() => {
-    writeToFile(current)
-    flushTimer = null
-  }, 300)
+  updateStore({ collapsedCollections: data })
 }

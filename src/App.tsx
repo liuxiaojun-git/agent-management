@@ -1,11 +1,13 @@
 // 应用入口 — 路由配置，定义所有页面路径与 Layout 布局
+import { lazy, Suspense } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './components/Layout'
-import Home from './pages/Home'
-import ApiTest from './pages/ApiTest'
-import Logs from './pages/Logs'
-import Models from './pages/Models'
-import LoginPage from './pages/LoginPage'
+
+const Home = lazy(() => import('./pages/Home'))
+const ApiTest = lazy(() => import('./pages/ApiTest'))
+const Logs = lazy(() => import('./pages/Logs'))
+const Models = lazy(() => import('./pages/Models'))
+const LoginPage = lazy(() => import('./pages/LoginPage'))
 
 // 检查是否已登录
 function isAuthenticated() {
@@ -27,18 +29,37 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 export default function App() {
   return (
     <BrowserRouter basename={import.meta.env.BASE_URL}>
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route element={<Layout />}>
-          <Route index element={
-            isAuthenticated() ? <Navigate to="/home" replace /> : <Navigate to="/login" replace />
-          } />
-          <Route path="home" element={<ProtectedRoute><Home /></ProtectedRoute>} />
-          <Route path="api-test" element={<ProtectedRoute><ApiTest /></ProtectedRoute>} />
-          <Route path="logs" element={<ProtectedRoute><Logs /></ProtectedRoute>} />
-          <Route path="models" element={<ProtectedRoute><Models /></ProtectedRoute>} />
-        </Route>
-      </Routes>
+      <Suspense fallback={<div className="flex min-h-screen items-center justify-center">加载中…</div>}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<Layout />}>
+            <Route
+              index
+              element={
+                isAuthenticated()
+                  ? <Navigate to="/home" replace />
+                  : <Navigate to="/login" replace />
+              }
+            />
+            <Route
+              path="home"
+              element={<ProtectedRoute><Home /></ProtectedRoute>}
+            />
+            <Route
+              path="api-test"
+              element={<ProtectedRoute><ApiTest /></ProtectedRoute>}
+            />
+            <Route
+              path="logs"
+              element={<ProtectedRoute><Logs /></ProtectedRoute>}
+            />
+            <Route
+              path="models"
+              element={<ProtectedRoute><Models /></ProtectedRoute>}
+            />
+          </Route>
+        </Routes>
+      </Suspense>
     </BrowserRouter>
   )
 }
