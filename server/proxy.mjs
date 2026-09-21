@@ -21,6 +21,12 @@ export async function handleProxyRequest(req, res) {
       delete sanitizedOptions.signal
       delete sanitizedOptions.bodyUsed
       delete sanitizedOptions.duplex
+      const bodyEncoding = sanitizedOptions.bodyEncoding
+      delete sanitizedOptions.bodyEncoding
+
+      if (bodyEncoding === 'base64' && typeof sanitizedOptions.body === 'string') {
+        sanitizedOptions.body = Buffer.from(sanitizedOptions.body, 'base64')
+      }
 
       const upstream = await fetch(targetUrl, sanitizedOptions)
       const buffer = Buffer.from(await upstream.arrayBuffer())

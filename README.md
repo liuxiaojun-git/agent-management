@@ -1,7 +1,26 @@
 # agent-management
-知航控制台
+智域
 
 ## 部署（DEV 环境）
+
+## 本地一键启动前后端
+
+在本项目根目录执行：
+
+```powershell
+npm run dev:all
+```
+
+该命令会同时启动前端（`http://localhost:8081`）和相邻目录
+`../zhiyu-backend` 中的后端（`http://localhost:3000`）。首次启动或依赖变更后，执行：
+
+```powershell
+.\start-dev.ps1 -Install
+```
+
+按 `Ctrl+C` 会停止前端和由脚本启动的后端。
+
+也可以直接双击根目录的 `启动前后端.exe`。请保留该文件在当前前端项目根目录，且后端项目位于相邻的 `../zhiyu-backend` 目录。启动器源码在 `tools/StartFrontendBackend.cs`，改动后执行 `.\tools\build-launcher.ps1` 重新编译。
 
 以下说明演示如何将本项目构建并部署到 DEV 域名，例如 https://qingzhou-dev.heyshare.cn。
 

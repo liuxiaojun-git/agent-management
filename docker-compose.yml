@@ -8,5 +8,5 @@ services:
     image: agent-management:v1.0.0 # 顺便指定镜像名称和版本，方便后续管理
     container_name: agent-management-frontend # 给容器起个固定的名字
     ports:
-      - '80:80'
+      - '8081:80'
     restart: unless-stopped

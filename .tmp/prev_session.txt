@@ -1,0 +1,31 @@
+完成。已在三处问答界面统一调整：问答内容最底部与问答框之间现在固定保持 **64px** 间距（`pb-16`），并且此前最后一条消息会被悬浮输入框遮挡的问题一并解决。
+
+改动如下（均在 [Knowledge.tsx](src/pages/Knowledge.tsx)）：
+
+1. **知识库问答主界面**（[Knowledge.tsx:1060-1082](src/pages/Knowledge.tsx#L1060-L1082)）
+   - 消息列表底部内边距 `pb-40`（160px）→ `pb-16`（64px）
+   - 问答框由 `absolute` 悬浮定位改为普通流式布局（`shrink-0` 正常排布在消息列表下方），去掉了遮罩渐变。这样无论输入框高度如何变化，间距都精确为 64px，且最后一条消息不再被盖住。
+
+2. **文档预览页的“AI 助手”侧栏**（[Knowledge.tsx:428-434](src/pages/Knowledge.tsx#L428-L434)）
+   - 消息列表 `py-5` → `pb-16 pt-5`，底部留出 64px。
+
+3. **知识库页内文档助手的问答面板**（[Knowledge.tsx:1041-1044](src/pages/Knowledge.tsx#L1041-L1044)）
+   - 消息列表 `pb-64` → `pb-16`
+   - 问答输入区同样从 `absolute` 悬浮改为普通流式布局。
+
+核心思路：原来输入框用 `absolute bottom-0` 覆盖在滚动区上，底部 padding 只是“猜”一个足够大的值，间距既不准、消息也容易被遮住；现在改为输入框与消息列表正常的 flex 纵向排布，`pb-16`（64px）即消息底部到输入框的精确间距，任何状态下都稳定为 64px。
+完成。问答输入框的双层外框已取消。
+
+问题根源:主问答区的输入框之前是**双重嵌套**结构 —— `<form>` 和内部多余的 `<div>` 套着完全相同的 `border rounded-2xl p-3 shadow` 样式,渲染成两个同心圆角框,看起来像一圈粗的双层外框。
+
+修复方式(主问答区 [Knowledge.tsx:1074-1078](src/pages/Knowledge.tsx#L1074-L1078)):删除了那个冗余的内层 `<div>`,保留单个 `<form>`,现在输入框是**一圈干净的圆角边框 + 阴影**:
+
+```jsx
+<form onSubmit={ask} className="mx-auto max-w-4xl rounded-2xl border border-base-300 bg-base-100 p-3 shadow-lg shadow-black/5 focus-within:border-primary/40">
+  {editingMessageIndex !== null ? ...编辑提示... : null}
+  <textarea ... />
+  <div className="mt-2 flex items-center justify-between">...快速回答/发送...</div>
+</form>
+```
+
+另外两个问答输入框(文档助手侧栏 [Knowledge.tsx:437](src/pages/Knowledge.tsx#L437)、知识库文档助手面板)本来就是单层结构,没有重复外框,无需改动。

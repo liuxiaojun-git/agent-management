@@ -7,7 +7,8 @@ import { handleProxyRequest } from './proxy.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const distDir = join(__dirname, '..', 'dist')
-const port = Number(process.env.PORT || 4173)
+const host = '0.0.0.0'
+const port = 8081
 const apiBase = process.env.API_BASE || '/api/data'
 
 const contentTypeMap = {
@@ -110,7 +111,7 @@ const server = createServer(async (req, res) => {
   await serveFile(res, filePath)
 })
 
-server.listen(port, () => {
-  console.log(`Production server running on http://localhost:${port}`)
+server.listen(port, host, () => {
+  console.log(`Production server running on http://${host}:${port}`)
   console.log(`API endpoint: ${apiBase}`)
 })

@@ -4,7 +4,8 @@
     "name": "阿里云百炼",
     "provider": "dashscope",
     "models": [
-      "qwen-max"
+      "qwen3.7-plus",
+      "qwen3.8-max"
     ],
     "enabled": true,
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -16,7 +17,7 @@
     "name": "DeepSeek",
     "provider": "deepseek",
     "models": [
-      "deepseek-reasoner-v4"
+      "deepseek-v4-flash"
     ],
     "enabled": false,
     "endpoint": "https://api.deepseek.com/v1",

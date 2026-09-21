@@ -11,7 +11,7 @@ export default function Layout() {
       {/* 移动端遮罩层 */}
       {sidebarOpen && (
         <div
-          className="fixed inset-0 z-40 bg-black/50 lg:hidden"
+          className="fixed inset-0 z-40 bg-black/50 md:hidden"
           onClick={() => setSidebarOpen(false)}
         />
       )}
@@ -23,7 +23,7 @@ export default function Layout() {
       <main className="relative flex-1 overflow-y-auto p-4 pt-14 md:p-6 md:pt-6">
         {/* 移动端菜单按钮 */}
         <button
-          className="btn btn-ghost btn-square fixed left-3 top-3 z-30 lg:hidden"
+          className="btn btn-ghost btn-square fixed left-3 top-3 z-30 md:hidden"
           onClick={() => setSidebarOpen(true)}
           aria-label="打开菜单"
         >

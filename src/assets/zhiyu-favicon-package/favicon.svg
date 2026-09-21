@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>智域 AI - Personal AI Workspace</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7fcff"/>
+      <stop offset="0.55" stop-color="#eef6ff"/>
+      <stop offset="1" stop-color="#f3efff"/>
+    </linearGradient>
+    <linearGradient id="zTop" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="0.55" stop-color="#218cf7"/>
+      <stop offset="1" stop-color="#31c6e8"/>
+    </linearGradient>
+    <linearGradient id="zMid" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2495f4"/>
+      <stop offset="0.55" stop-color="#315eea"/>
+      <stop offset="1" stop-color="#5647e9"/>
+    </linearGradient>
+    <linearGradient id="zBottom" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#273bd1"/>
+      <stop offset="0.55" stop-color="#5b48ed"/>
+      <stop offset="1" stop-color="#b072f2"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#24bfe9"/>
+      <stop offset="1" stop-color="#7650ef"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-opacity="0.14"/>
+    </filter>
+  </defs>
+  <rect x="56" y="56" width="912" height="912" rx="190" fill="url(#bg)" filter="url(#shadow)"/>
+  <g transform="translate(0,4)">
+    <path d="M278 287 C290 262 315 246 345 246 H699 C727 246 744 274 731 298 L711 333 H390 L305 401 C280 421 247 403 251 372 Z" fill="url(#zTop)"/>
+    <path d="M711 333 L405 604 C392 616 382 631 378 646 C370 676 393 705 425 705 H699 C727 705 744 732 731 757 L711 792 H387 C330 792 289 760 283 711 C277 663 301 626 338 592 L622 347 Z" fill="url(#zMid)"/>
+    <path d="M378 646 C367 675 390 704 425 705 H699 C727 705 744 732 731 757 L711 792 H387 C335 792 298 765 286 723 C280 702 283 680 291 662 C307 626 335 604 367 577 L405 545 L711 333 Z" fill="url(#zBottom)" opacity="0.96"/>
+    <path d="M302 400 L622 347 L711 333 L405 604 C392 616 382 631 378 646 C374 659 377 671 384 682 C367 674 355 658 358 641 C362 620 374 603 392 586 Z" fill="#ffffff" opacity="0.10"/>
+    <path d="M705 460 C748 460 783 435 803 396 C823 435 858 460 901 460 C858 460 823 485 803 524 C783 485 748 460 705 460 Z" fill="url(#spark)"/>
+  </g>
+</svg>
