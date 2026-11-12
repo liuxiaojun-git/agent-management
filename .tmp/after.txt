@@ -1,0 +1,21 @@
+script     {
+ "panelText": "接口信息 ⠿ 📁 Qingzhou-158 (7) ⠿ 📁 Qingzhou-DEV (9) ⠿ 📁 mediahub2 (2) ⠿ 📁 Space 365 (2) ⠿ 📁 其他测试 (1) ⠿ POST 敏感词纪要生成测试 https://qingzhou-dev.heyshare.cn/api/v1/agent/summary/generate 200 ⠿ 📁 管理员测试 (1) + 新建集合",
+ "rows": [],
+ "storedKeys": [
+  "collections",
+  "folders",
+  "requests",
+  "collapsedCollections",
+  "collapsedFolders"
+ ],
+ "collectionCount": 6,
+ "requestCount": 22,
+ "folders": [],
+ "collapsedFolders": {},
+ "hasParentOnFirst": false,
+ "setBodyKeys": null
+}
+
+console errors/warnings (0):
+
+requests failed (0):

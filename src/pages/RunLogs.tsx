@@ -1,12 +1,41 @@
 import { useState, useEffect } from 'react'
-import { getLogs, type LogEntry } from '../utils/logStore'
+import { clearLogCache, getLogs, type LogEntry } from '../utils/logStore'
 import Pagination from '../components/Pagination'
 import SearchInput from '../components/SearchInput'
 import DateRangePicker from '../components/DateRangePicker'
 
+const formatCreatedTime = (timestamp: number, fallback: string) => {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return fallback
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+// 首字延时为 0（含 0 / 0ms / 0s，常见于即时返回）视为无有效测量，统一用 - 呈现
+const formatFirstCharDelay = (value?: string | number | null) => {
+  if (value === null || value === undefined || value === '') return '-'
+  const text = String(value).trim()
+  const n = Number.parseFloat(text)
+  if (!Number.isNaN(n) && n === 0) return '-'
+  return text
+}
+
 export default function RunLogs() {
   const [logs, setLogs] = useState<LogEntry[]>([])
-  useEffect(() => { getLogs('audit').then(setLogs) }, [])
+  useEffect(() => {
+    let active = true
+    const refresh = () => {
+      // 问答运行日志由后端直接写入，每次绕过前端缓存读取最新数据。
+      clearLogCache('audit')
+      getLogs('audit').then((nextLogs) => { if (active) setLogs(nextLogs) })
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 5000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [])
   const [filterApi, setFilterApi] = useState('所有接口')
   const [filterModel, setFilterModel] = useState('所有模型')
   const [filterStatus, setFilterStatus] = useState('所有状态')
@@ -16,7 +45,8 @@ export default function RunLogs() {
   const sixMonthsAgo = new Date(); sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6)
   const defaultStart = `${sixMonthsAgo.getFullYear()}-${String(sixMonthsAgo.getMonth()+1).padStart(2,'0')}-${String(sixMonthsAgo.getDate()).padStart(2,'0')}T${String(sixMonthsAgo.getHours()).padStart(2,'0')}:${String(sixMonthsAgo.getMinutes()).padStart(2,'0')}`
   const now = new Date()
-  const defaultEnd = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}T${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`
+  // 默认覆盖到当天结束，避免页面打开后新生成的运行日志落在筛选结束时间之外。
+  const defaultEnd = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}T23:59`
   const [startDate, setStartDate] = useState(defaultStart)
   const [endDate, setEndDate] = useState(defaultEnd)
   const [detailModal, setDetailModal] = useState<LogEntry | null>(null)
@@ -28,8 +58,11 @@ export default function RunLogs() {
 
   // API 接口名称映射
   const apiNames: Record<string, string> = {
+    'knowledge/ask': '知识库问答',
     'health/score': '会议健康度评分',
-    'chat/completions': 'Chat — 对话',
+    '/api/chat': 'AI 问答',
+    'chat': 'AI 问答',
+    'chat/completions': 'AI 问答',
     'cocreate': '纪要校对与共创',
     'summary/clarified': '澄清后纪要生成',
     'summary': '会议纪要生成',
@@ -60,7 +93,7 @@ export default function RunLogs() {
     if (search) {
       const q = search.toLowerCase()
       const match = (s: string) => s.toLowerCase().includes(q)
-      if (!match(log.id) && !match(log.message) && !match(log.detail) && !match(log.api || '')) return false
+      if (!match(log.id) && !match(log.requestId || '') && !match(log.userName || '') && !match(log.message) && !match(log.detail) && !match(log.api || '')) return false
     }
     return true
   })
@@ -72,8 +105,8 @@ export default function RunLogs() {
     <div className="h-full flex flex-col">
       {/* 搜索 + 筛选 */}
       <div className="mb-4 flex items-center gap-3 flex-wrap">
-        <SearchInput placeholder="搜索 Minutes ID" value={search} onChange={handleSearch} />
-        <DateRangePicker startDate={startDate} endDate={endDate} onStartChange={(v) => { setStartDate(v); setPage(1) }} onEndChange={(v) => { setEndDate(v); setPage(1) }} onReset={() => { const d = new Date(); const s = new Date(); s.setMonth(s.getMonth() - 6); setStartDate(`${s.getFullYear()}-${String(s.getMonth()+1).padStart(2,'0')}-${String(s.getDate()).padStart(2,'0')}T${String(s.getHours()).padStart(2,'0')}:${String(s.getMinutes()).padStart(2,'0')}`); setEndDate(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}T${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`); setPage(1) }} />
+        <SearchInput placeholder="搜索 Request ID" value={search} onChange={handleSearch} />
+        <DateRangePicker startDate={startDate} endDate={endDate} onStartChange={(v) => { setStartDate(v); setPage(1) }} onEndChange={(v) => { setEndDate(v); setPage(1) }} onReset={() => { const d = new Date(); const s = new Date(); s.setMonth(s.getMonth() - 6); setStartDate(`${s.getFullYear()}-${String(s.getMonth()+1).padStart(2,'0')}-${String(s.getDate()).padStart(2,'0')}T${String(s.getHours()).padStart(2,'0')}:${String(s.getMinutes()).padStart(2,'0')}`); setEndDate(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}T23:59`); setPage(1) }} />
         <select className="select select-bordered w-40 h-10 min-h-0 rounded-2" value={filterApi} onChange={(e) => handleFilterApi(e.target.value)}>
           <option>所有接口</option>
           {apiDisplayOptions.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
@@ -96,12 +129,13 @@ export default function RunLogs() {
           <table className="table w-full text-base table-fixed">
             <thead>
             <tr className="text-base text-base-content/60">
-              <th className="sticky top-0 z-10 bg-base-100 text-sm w-30">开始时间</th>
-              <th className="sticky top-0 z-10 bg-base-100 text-sm w-50">Minutes ID</th>
+              <th className="sticky top-0 z-10 bg-base-100 text-sm w-30">创建时间</th>
+              <th className="sticky top-0 z-10 bg-base-100 text-sm w-20">用户</th>
+              <th className="sticky top-0 z-10 bg-base-100 text-sm w-50">Request ID</th>
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-16">状态</th>
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-16">运行时间</th>
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-16">首字延时</th>
-              <th className="sticky top-0 z-10 bg-base-100 text-sm w-16">Tokens</th>
+              <th className="sticky top-0 z-10 bg-base-100 text-sm w-28">Tokens</th>
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-36">API 接口</th>
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-24">模型</th>
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-30 text-center">操作</th>
@@ -119,8 +153,9 @@ export default function RunLogs() {
               </tr>
             ) : paged.map((log) => (
                 <tr key={log.id} className="transition-colors hover:bg-base-200">
-                  <td className="text-sm text-base-content truncate w-30" title={log.time}>{log.time}</td>
-                  <td className="text-sm text-base-content truncate w-50" title={log.id}>{log.id}</td>
+                  <td className="text-sm text-base-content truncate w-30" title={formatCreatedTime(log.timestamp, log.time)}>{formatCreatedTime(log.timestamp, log.time)}</td>
+                  <td className="text-sm text-base-content truncate w-20" title={log.userName || '-'}>{log.userName || '-'}</td>
+                  <td className="text-sm text-base-content truncate w-50" title={log.requestId || '-'}>{log.requestId || '-'}</td>
                   <td className="truncate w-30">
                     {log.status ? (
                       <span className={`inline-flex items-center h-6 gap-1 rounded-sm px-2 text-sm font-medium text-white ${log.status === 'success' ? 'bg-success' : 'bg-error/80'}`}>
@@ -131,8 +166,14 @@ export default function RunLogs() {
                     )}
                   </td>
                   <td className="text-sm text-base-content truncate w-30" title={log.duration || '-'}>{log.duration || '-'}</td>
-                  <td className="text-sm text-base-content truncate w-30" title={log.firstCharDelay || '-'}>{log.firstCharDelay || '-'}</td>
-                  <td className="text-sm text-base-content truncate w-30" title={log.tokens !== undefined && log.tokens !== null ? log.tokens.toLocaleString() : '0'}>{log.tokens !== undefined && log.tokens !== null ? log.tokens.toLocaleString() : '0'}</td>
+                  <td className="text-sm text-base-content truncate w-30" title={formatFirstCharDelay(log.firstCharDelay)}>{formatFirstCharDelay(log.firstCharDelay)}</td>
+                  <td className="text-sm text-base-content w-28">
+                    <div className="grid gap-1 whitespace-nowrap">
+                      <span>全部 Token&nbsp;&nbsp;<strong>{log.tokens ?? '-'}</strong></span>
+                      <span>输出 Token&nbsp;&nbsp;<strong>{log.outputTokens ?? '-'}</strong></span>
+                      <span>输入 Token&nbsp;&nbsp;<strong>{log.inputTokens ?? '-'}</strong></span>
+                    </div>
+                  </td>
                   <td className="text-sm text-base-content truncate w-36" title={log.api ? displayApi(log.api) : '-'}>{log.api ? displayApi(log.api) : '-'}</td>
                   <td className="text-sm text-base-content truncate w-24" title={log.model || ''}>{log.model || ''}</td>
                   <td className="text-sm text-base-content truncate w-30 text-center">
@@ -170,15 +211,17 @@ export default function RunLogs() {
             </div>
             <div className="divide-y divide-base-200 text-sm overflow-y-auto h-160">
               <div className="flex gap-12 py-3">
-                <span className="text-base-content/50 shrink-0 w-24">开始时间：</span>
-                <span className="text-base-content">{detailModal.time}</span>
+                <span className="text-base-content/50 shrink-0 w-24">创建时间：</span>
+                <span className="text-base-content">{formatCreatedTime(detailModal.timestamp, detailModal.time)}</span>
               </div>
-              {detailModal.id && (
-                <div className="flex gap-12 py-3">
-                  <span className="text-base-content/50 shrink-0 w-24">Minutes ID：</span>
-                  <span className="text-base-content break-all">{detailModal.id}</span>
-                </div>
-              )}
+              <div className="flex gap-12 py-3">
+                <span className="text-base-content/50 shrink-0 w-24">用户：</span>
+                <span className="text-base-content break-all">{detailModal.userName || '-'}</span>
+              </div>
+              <div className="flex gap-12 py-3">
+                <span className="text-base-content/50 shrink-0 w-24">Request ID：</span>
+                <span className="text-base-content break-all">{detailModal.requestId || '-'}</span>
+              </div>
               <div className="flex gap-12 py-3">
                 <span className="text-base-content/50 shrink-0 w-24">状态：</span>
                 <span className={detailModal.status === 'failed' ? 'text-error font-medium' : 'text-base-content'}>
@@ -191,11 +234,15 @@ export default function RunLogs() {
               </div>
               <div className="flex gap-12 py-3">
                 <span className="text-base-content/50 shrink-0 w-24">首字延时：</span>
-                <span className="text-base-content">{detailModal.firstCharDelay || '-'}</span>
+                <span className="text-base-content">{formatFirstCharDelay(detailModal.firstCharDelay)}</span>
               </div>
               <div className="flex gap-12 py-3">
-                <span className="text-base-content/50 shrink-0 w-24">总 Token 数：</span>
-                <span className="text-base-content">{detailModal.tokens !== undefined && detailModal.tokens !== null ? `${detailModal.tokens.toLocaleString()} Tokens` : '0 Tokens'}</span>
+                <span className="text-base-content/50 shrink-0 w-24">Tokens：</span>
+                <div className="grid gap-2 text-base-content">
+                  <span>全部 Token&nbsp;&nbsp;{detailModal.tokens ?? '-'}</span>
+                  <span>输出 Token&nbsp;&nbsp;{detailModal.outputTokens ?? '-'}</span>
+                  <span>输入 Token&nbsp;&nbsp;{detailModal.inputTokens ?? '-'}</span>
+                </div>
               </div>
               {detailModal.api && (
                 <div className="flex gap-12 py-3">

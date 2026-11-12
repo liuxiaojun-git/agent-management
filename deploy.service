@@ -1,0 +1,14 @@
+[Unit]
+Description=Agent Management Frontend
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent-management
+ExecStart=/usr/bin/node /opt/agent-management/server/app.mjs
+Restart=always
+RestartSec=5
+Environment=API_BASE=/api/data
+
+[Install]
+WantedBy=multi-user.target

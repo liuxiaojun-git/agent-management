@@ -1,6 +1,8 @@
 // 模型管理 — AI 模型配置管理，支持模型列表展示、启用/停用、参数编辑等操作
+// （批次 F：从旧 /api/data 的 model-providers 全表替换 → v1 的 /providers 逐条 CRUD）
 import { useState, useEffect } from 'react'
 import { addLog } from '../utils/logStore'
+import { V1_BASE } from '../utils/apiBase'
 
 interface ModelProvider {
   id: string
@@ -9,19 +11,30 @@ interface ModelProvider {
   models: string[]
   enabled: boolean
   endpoint: string
-  keyPreview: string
+  apiKeyName?: string
   latency: string
 }
 
-const mockProviders: ModelProvider[] = [
-  { id: '1', name: '阿里云百炼', provider: 'dashscope', models: ['qwen-max'], enabled: true, endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1', keyPreview: 'sk-2a8f4c19d7b65e03ef', latency: '320ms' },
-  { id: '2', name: 'DeepSeek', provider: 'deepseek', models: ['deepseek-reasoner-v4'], enabled: false, endpoint: 'https://api.deepseek.com/v1', keyPreview: 'sk-9c3e7f21a8b40d56cd', latency: '450ms' },
-]
-
-const maskKey = (key: string) => {
-  if (key.length <= 12) return key
-  return key.slice(0, 8) + '••••' + key.slice(-4)
+// v1 GET /providers 的原始形状（含脱敏字段，前端展示用不到，映射时剥掉）。
+interface RawProvider {
+  id: string
+  name: string
+  provider: string
+  models: string[]
+  enabled: boolean
+  endpoint: string | null
+  apiKeyMasked?: string
+  hasApiKey?: boolean
+  apiKeyName?: string
+  keyPreview?: string
+  latency?: string | null
+  sortOrder?: number
 }
+
+const mockProviders: ModelProvider[] = [
+  { id: '1', name: '阿里云百炼', provider: 'dashscope', models: ['qwen3.7-plus', 'qwen3.8-max'], enabled: true, endpoint: 'https://dashscope.aliyuncs.com/compatible-mode/v1', apiKeyName: 'DASHSCOPE_API_KEY', latency: '320ms' },
+  { id: '2', name: 'DeepSeek', provider: 'deepseek', models: ['deepseek-v4-flash'], enabled: false, endpoint: 'https://api.deepseek.com/v1', apiKeyName: 'DEEPSEEK_API_KEY', latency: '450ms' },
+]
 
 const modelColors: Record<string, string> = {
   dashscope: 'border-l-cyan-500',
@@ -30,59 +43,157 @@ const modelColors: Record<string, string> = {
 
 const FILE_KEY = 'model-providers'
 
-async function loadProviders(): Promise<typeof mockProviders> {
-  try {
-    const res = await fetch('/api/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'get', name: FILE_KEY }),
-    })
-    const result = await res.json()
-    if (result.success && result.data) return result.data
-  } catch { /* ignore */ }
-  // 本地兜底
-  try {
-    const saved = localStorage.getItem(FILE_KEY)
-    if (saved) return JSON.parse(saved)
-  } catch { /* ignore */ }
-  return mockProviders
+// v1 行 → 前端 ModelProvider。models 是 mysql2 已解析的数组；endpoint/latency 可能为 NULL。
+function toModelProvider(row: RawProvider): ModelProvider {
+  return {
+    id: row.id,
+    name: row.name,
+    provider: row.provider,
+    models: Array.isArray(row.models) ? row.models : [],
+    enabled: Boolean(row.enabled),
+    endpoint: row.endpoint || '',
+    apiKeyName: row.apiKeyName,
+    latency: row.latency || '-',
+  }
 }
 
-async function saveProviders(data: typeof mockProviders) {
-  try {
-    await fetch('/api/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'set', name: FILE_KEY, data }),
-    })
-  } catch { /* ignore */ }
-  localStorage.setItem(FILE_KEY, JSON.stringify(data))
+const useAliyunModels = (providers: ModelProvider[]) => providers.map((provider) => {
+  if (provider.provider !== 'dashscope') return provider
+  const supportedModels = ['qwen3.7-plus', 'qwen3.8-max']
+  const selectedModel = supportedModels.includes(provider.models[0]) ? provider.models[0] : supportedModels[0]
+  return { ...provider, models: [selectedModel, ...supportedModels.filter((model) => model !== selectedModel)] }
+})
+
+// v1 请求：带 Bearer，401 清态跳登录，非 2xx / code !== 0 抛错。
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const token = localStorage.getItem('access_token')
+  const response = await fetch(`${V1_BASE}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init.headers || {}),
+    },
+  })
+  if (response.status === 401) {
+    localStorage.removeItem('access_token')
+    localStorage.removeItem('user')
+    window.location.assign('/login')
+    throw new Error('登录状态已失效，请重新登录')
+  }
+  const payload = await response.json().catch(() => ({})) as { code?: number | string; message?: string; data?: T }
+  if (!response.ok || payload.code !== 0) throw new Error(payload.message || `请求失败（${response.status}）`)
+  return payload.data as T
+}
+
+const cacheProviders = (data: ModelProvider[]) => {
+  try { localStorage.setItem(FILE_KEY, JSON.stringify(data)) } catch { /* ignore */ }
+}
+
+let loadPromise: Promise<ModelProvider[]> | null = null
+async function loadProviders(): Promise<ModelProvider[]> {
+  if (!loadPromise) {
+    loadPromise = (async () => {
+      try {
+        const rows = await request<RawProvider[]>('/providers')
+        return useAliyunModels(rows.map(toModelProvider))
+      } catch { /* ignore */ }
+      try {
+        const saved = localStorage.getItem(FILE_KEY)
+        if (saved) return useAliyunModels(JSON.parse(saved) as ModelProvider[])
+      } catch { /* ignore */ }
+      return mockProviders
+    })()
+  }
+  return loadPromise
 }
 
 export default function Models() {
-  const [providers, setProviders] = useState<typeof mockProviders>(mockProviders)
+  const [providers, setProviders] = useState<ModelProvider[]>(mockProviders)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [showModal, setShowModal] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null)
+  // 新增表单
+  const [form, setForm] = useState({ name: '', provider: '', endpoint: '', models: '', latency: '' })
+
   useEffect(() => { loadProviders().then(setProviders) }, [])
+
+  const resetForm = () => setForm({ name: '', provider: '', endpoint: '', models: '', latency: '' })
+
+  const handleAdd = () => {
+    if (!form.name.trim() || !form.endpoint.trim()) return
+    // 后端为 POST 生成 uuid 风格 id（p-xxx），前端先用本地占位 id 乐观显示，创建成功后再回填真实 id。
+    const tempId = `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+    const newProvider: ModelProvider = {
+      id: tempId, name: form.name.trim(), provider: form.provider.trim() || 'custom',
+      models: form.models.split(',').map(m => m.trim()).filter(Boolean),
+      enabled: true, endpoint: form.endpoint.trim(),
+      latency: form.latency || '-',
+    }
+    setProviders(current => { const next = [...current, newProvider]; cacheProviders(next); return next })
+    addLog({ time: new Date().toLocaleString('zh-CN', { hour12: false }), level: 'info', source: '模型', message: `用户 admin 新增模型服务商: ${newProvider.name}`, detail: `提供商: ${newProvider.provider}`, category: 'operation', status: 'success' })
+    setShowModal(false)
+    resetForm()
+    void request<{ provider: RawProvider }>('/providers', {
+      method: 'POST',
+      body: JSON.stringify({ name: newProvider.name, provider: newProvider.provider, models: newProvider.models, enabled: true, endpoint: newProvider.endpoint, latency: newProvider.latency }),
+    }).then((created) => {
+      const saved = toModelProvider(created.provider)
+      setProviders(current => { const next = current.map(p => p.id === tempId ? saved : p); cacheProviders(next); return next })
+    }).catch(() => { /* 保持乐观态；下次 loadProviders 会拉回真实数据 */ })
+  }
+
+  const handleDelete = (id: string) => {
+    const p = providers.find(x => x.id === id)
+    setProviders(current => { const next = current.filter(x => x.id !== id); cacheProviders(next); return next })
+    setDeleteTarget(null)
+    if (editingId === id) setEditingId(null)
+    if (p) addLog({ time: new Date().toLocaleString('zh-CN', { hour12: false }), level: 'info', source: '模型', message: `用户 admin 删除模型服务商: ${p.name}`, detail: `提供商: ${p.provider}`, category: 'operation', status: 'success' })
+    void request(`/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {})
+  }
 
   const toggleProvider = (id: string) => {
     setProviders(prev => {
       const p = prev.find(x => x.id === id)
+      if (!p) return prev
       const updated = prev.map(x => x.id === id ? { ...x, enabled: !x.enabled } : x)
-      saveProviders(updated)
-      if (p) addLog({ time: new Date().toLocaleString('zh-CN', { hour12: false }), level: 'info', source: '模型', message: `用户 admin 切换模型服务商状态: ${p.name} → ${p.enabled ? '禁用' : '启用'}`, detail: `提供商: ${p.provider}`, category: 'operation', status: 'success' })
+      cacheProviders(updated)
+      addLog({ time: new Date().toLocaleString('zh-CN', { hour12: false }), level: 'info', source: '模型', message: `用户 admin 切换模型服务商状态: ${p.name} → ${p.enabled ? '禁用' : '启用'}`, detail: `提供商: ${p.provider}`, category: 'operation', status: 'success' })
+      void request(`/providers/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify({ enabled: !p.enabled }) }).catch(() => {})
+      return updated
+    })
+  }
+
+  const selectModel = (providerId: string, model: string) => {
+    setProviders((current) => {
+      const updated = current.map((provider) => provider.id === providerId
+        ? { ...provider, models: [model, ...provider.models.filter((item) => item !== model)] }
+        : provider)
+      const target = updated.find((provider) => provider.id === providerId)
+      cacheProviders(updated)
+      if (target) void request(`/providers/${encodeURIComponent(providerId)}`, { method: 'PUT', body: JSON.stringify({ models: target.models }) }).catch(() => {})
+      return updated
+    })
+  }
+
+  const updateProvider = (providerId: string, patch: Partial<ModelProvider>) => {
+    setProviders((current) => {
+      const updated = current.map((provider) => provider.id === providerId ? { ...provider, ...patch } : provider)
+      cacheProviders(updated)
+      void request(`/providers/${encodeURIComponent(providerId)}`, { method: 'PUT', body: JSON.stringify(patch) }).catch(() => {})
       return updated
     })
   }
 
   return (
-    <div>
+    <div className="h-full flex flex-col">
       {/* 标题栏 */}
-      <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between shrink-0">
         <div>
           <h1 className="text-2xl font-bold">模型管理</h1>
           <p className="text-base-content/60 mt-1"></p>
         </div>
-        <button className="btn btn-primary">
+        <button className="btn btn-primary" onClick={() => { resetForm(); setShowModal(true) }}>
           <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
           新增服务商
         </button>
@@ -113,7 +224,10 @@ export default function Models() {
                 </div>
               </div>
               <div className="flex items-center gap-3">
-                <button className="btn btn-ghost btn-sm btn-square" onClick={() => setEditingId(editingId === p.id ? null : p.id)}>
+                <button className="btn btn-ghost btn-sm btn-square hover:text-error" onClick={() => setDeleteTarget(p.id)} title="删除">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+                </button>
+                <button className="btn btn-ghost btn-sm btn-square" onClick={() => setEditingId(editingId === p.id ? null : p.id)} title="编辑">
                   <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
                 </button>
                 <input type="checkbox" className="toggle toggle-primary toggle-sm" checked={p.enabled} onChange={() => toggleProvider(p.id)} />
@@ -122,9 +236,9 @@ export default function Models() {
 
             {/* 模型列表 */}
             <div className="flex flex-wrap gap-2 px-5 py-3">
-              {p.models.map((m) => (
+              {p.models.map((m, index) => (
                 <span key={m} className="badge badge-outline badge-sm gap-1">
-                  {p.enabled ? '🟢' : '⚪'} {m}
+                  {p.enabled && index === 0 ? '🟢' : '⚪'} {m}{index === 0 ? '（当前）' : ''}
                 </span>
               ))}
             </div>
@@ -135,11 +249,24 @@ export default function Models() {
                 <div className="grid grid-cols-1 sm:grid-cols-1 gap-6">
                   <div className="flex items-center gap-6">
                     <label className="label w-16 shrink-0"><span className="label-text text-xs">Endpoint</span></label>
-                    <input type="text" className="input input-bordered input-sm w-180" defaultValue={p.endpoint} />
+                    <input
+                      type="text"
+                      className="input input-bordered input-sm w-180"
+                      value={p.endpoint}
+                      onChange={(event) => updateProvider(p.id, { endpoint: event.target.value })}
+                    />
                   </div>
                   <div className="flex items-center gap-6">
-                    <label className="label w-16 shrink-0"><span className="label-text text-xs">API Key</span></label>
-                    <input type="text" className="input input-bordered input-sm font-mono text-xs w-180" defaultValue={maskKey(p.keyPreview)} placeholder="输入密钥..." readOnly />
+                    <label className="label w-16 shrink-0"><span className="label-text text-xs">当前模型</span></label>
+                    <select className="select select-bordered select-sm w-180" value={p.models[0] || ''} onChange={(event) => selectModel(p.id, event.target.value)}>
+                      {p.models.map((model) => <option key={model} value={model}>{model}</option>)}
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-6">
+                    <label className="label w-16 shrink-0"><span className="label-text text-xs">API Key 名称</span></label>
+                    <div className="input input-bordered input-sm flex w-180 items-center bg-base-200 font-mono text-xs text-base-content/60" aria-label="API Key 名称">
+                      {p.apiKeyName || '后端未配置'}
+                    </div>
                   </div>
                 </div>
                 <div className="mt-3 flex justify-end gap-2">
@@ -151,6 +278,60 @@ export default function Models() {
           </div>
         ))}
       </div>
+
+      {/* 新增服务商弹窗 */}
+      {showModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowModal(false)}>
+          <div className="w-full max-w-lg rounded-box bg-base-100 p-6 shadow-xl border border-base-200" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="font-bold text-base">新增服务商</h3>
+              <button className="btn btn-ghost btn-square btn-sm" onClick={() => setShowModal(false)}>
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+              </button>
+            </div>
+            <div className="space-y-4 text-sm">
+              <div className="flex items-center gap-4">
+                <label className="label w-20 shrink-0"><span className="label-text text-xs">名称</span></label>
+                <input type="text" className="input input-bordered input-sm flex-1" placeholder="请输入名称" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+              </div>
+              <div className="flex items-center gap-4">
+                <label className="label w-20 shrink-0"><span className="label-text text-xs">提供商</span></label>
+                <input type="text" className="input input-bordered input-sm flex-1" placeholder="请输入提供商" value={form.provider} onChange={(e) => setForm({ ...form, provider: e.target.value })} />
+              </div>
+              <div className="flex items-center gap-4">
+                <label className="label w-20 shrink-0"><span className="label-text text-xs">Endpoint</span></label>
+                <input type="text" className="input input-bordered input-sm flex-1" placeholder="请输入Endpoint" value={form.endpoint} onChange={(e) => setForm({ ...form, endpoint: e.target.value })} />
+              </div>
+              <div className="flex items-center gap-4">
+                <label className="label w-20 shrink-0"><span className="label-text text-xs">模型</span></label>
+                <input type="text" className="input input-bordered input-sm flex-1" placeholder="请输入模型名称（逗号分隔）" value={form.models} onChange={(e) => setForm({ ...form, models: e.target.value })} />
+              </div>
+              <div className="flex items-center gap-4">
+                <label className="label w-20 shrink-0"><span className="label-text text-xs">延迟</span></label>
+                <input type="text" className="input input-bordered input-sm flex-1" placeholder="请输入延时时间（毫秒）" value={form.latency} onChange={(e) => setForm({ ...form, latency: e.target.value })} />
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button className="btn btn-ghost btn-sm" onClick={() => setShowModal(false)}>取消</button>
+              <button className="btn btn-primary btn-sm" onClick={handleAdd} disabled={!form.name.trim() || !form.endpoint.trim()}>保存</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 删除确认弹窗 */}
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setDeleteTarget(null)}>
+          <div className="w-full max-w-sm rounded-box bg-base-100 p-6 shadow-xl border border-base-200" onClick={(e) => e.stopPropagation()}>
+            <h3 className="font-bold text-base mb-2">确认删除</h3>
+            <p className="text-sm text-base-content/60">确定要删除该服务商吗？此操作不可撤销。</p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button className="btn btn-ghost btn-sm" onClick={() => setDeleteTarget(null)}>取消</button>
+              <button className="btn btn-error btn-sm" onClick={() => handleDelete(deleteTarget)}>删除</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

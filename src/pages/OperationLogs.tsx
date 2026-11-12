@@ -5,6 +5,13 @@ import Pagination from '../components/Pagination'
 import SearchInput from '../components/SearchInput'
 import DateRangePicker from '../components/DateRangePicker'
 
+const formatCreatedTime = (timestamp: number, fallback: string) => {
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return fallback
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 export default function OperationLogs() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   useEffect(() => { getLogs('operation').then(setLogs) }, [])
@@ -54,7 +61,7 @@ export default function OperationLogs() {
             <thead>
             <tr className="text-base text-base-content/60">
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-16">级别</th>
-              <th className="sticky top-0 z-10 bg-base-100 text-sm w-20">开始时间</th>
+              <th className="sticky top-0 z-10 bg-base-100 text-sm w-20">创建时间</th>
               <th className="sticky top-0 z-10 bg-base-100 text-sm w-100">详情</th>
             </tr>
           </thead>
@@ -83,7 +90,7 @@ export default function OperationLogs() {
                       )}
                     </span>
                   </td>
-                  <td className="text-sm text-base-content truncate w-30" title={log.time}>{log.time}</td>
+                  <td className="text-sm text-base-content truncate w-30" title={formatCreatedTime(log.timestamp, log.time)}>{formatCreatedTime(log.timestamp, log.time)}</td>
                   <td className="text-sm text-base-content truncate" title={`${log.message} · ${log.detail}`}>
                     <span className="truncate block max-w-[150ch]">{log.message}{log.detail ? ' · ' + log.detail : ''}</span>
                   </td>
