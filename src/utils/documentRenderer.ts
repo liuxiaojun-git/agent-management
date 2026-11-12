@@ -31,10 +31,20 @@ const sanitizeLink = (value: string) => {
 
 const markdownLineBreak = '\u0001'
 
+// 行内占位符的哨兵字符。用**私有区**码位 U+E000 而不是早先的 \u0000（NUL）：
+// 两者都"正常文本里不会出现"，但 NUL 是控制字符，写进正则字面量正是 no-control-regex
+// 要拦的东西 —— 它在源码里完全不可见，一旦有人手改这行极易错位且看不出错。U+E000 不是
+// 控制字符，规则自然通过，而"不可见"这件事本来就是哨兵这个设计要的。
+//
+// 哨兵只需要满足一个条件：不会被 escapeHtml 产出，也不会出现在输入文本里。escapeHtml 只
+// 转义 & < > " '，两者都满足。字符串与正则**共用这一个常量**，杜绝两处写法漂移。
+const inlineTokenSentinel = '\uE000'
+const inlineTokenPattern = new RegExp(`${inlineTokenSentinel}(\\d+)${inlineTokenSentinel}`, 'g')
+
 // 兼容从富文本/表格工具导出的 Markdown：这些内容会额外转义标点，或把链接重复包裹。
 const normalizeMarkdownSource = (markdown: string) => {
   const unescaped = markdown
-    .replace(/\\([\\`*{}\[\]()#+\-.!_>@:&$?])/g, '$1')
+    .replace(/\\([\\`*{}[\]()#+\-.!_>@:&$?])/g, '$1')
     .replace(/\*{4}([^*]+)\*{4}/g, '**$1**')
     .replace(/\[\[(https?:\/\/[^\]]+)\]\((https?:\/\/[^)]+)\)\]\((https?:\/\/[^)]+)\)/g, '[$1]($2)')
     .replace(/<br\s*\/?>/gi, markdownLineBreak)
@@ -46,8 +56,13 @@ const normalizeMarkdownSource = (markdown: string) => {
 
 const renderMarkdownInline = (value: string) => {
   const tokens: string[] = []
-  const token = (html: string) => `\u0000${tokens.push(html) - 1}\u0000`
-  let output = escapeHtml(value)
+  const token = (html: string) => `${inlineTokenSentinel}${tokens.push(html) - 1}${inlineTokenSentinel}`
+  // 生成占位符之前，先把输入里可能夹带的哨兵字符抹掉。否则一份刻意构造的文本
+  // （U+E000 + 数字 + U+E000）就能冒充占位符，让这里吐出 tokens 里的既有片段。
+  // 旧写法用 NUL 当哨兵，实践中几乎不可能从文本里混进来 —— 这条清洗是换成私有区码位之后
+  // 补上的，用来把那点安全性找回来：现在伪造这条路在构造上就不存在了。
+  // 被抹掉的是不可见码位，正常内容里本就不会有，看不出差别。
+  let output = escapeHtml(value.split(inlineTokenSentinel).join(''))
   output = output.replaceAll(markdownLineBreak, token('<br />'))
   output = output.replace(/`([^`]+)`/g, (_, code: string) => token(`<code>${code}</code>`))
   output = output.replace(/!?\[([^\]]*)\]\(([^\s)]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (_, label: string, href: string) => {
@@ -61,7 +76,7 @@ const renderMarkdownInline = (value: string) => {
   })
   output = output.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/__([^_]+)__/g, '<strong>$1</strong>')
   output = output.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>').replace(/(?<!_)_([^_]+)_(?!_)/g, '<em>$1</em>')
-  return output.replace(/\u0000(\d+)\u0000/g, (_, index: string) => tokens[Number(index)] || '')
+  return output.replace(inlineTokenPattern, (_, index: string) => tokens[Number(index)] || '')
 }
 
 /** 将常用 Markdown 安全转换为预览 HTML；原始 HTML 会被作为普通文本显示。 */
@@ -216,7 +231,10 @@ export async function parseExcelFile(dataUrl: string): Promise<ExcelSheet[]> {
           const mergedAcross = merges.some((merge) => merge.startRow === rowIndex && merge.startCol === columnIndex && merge.endCol > merge.startCol)
           if (mergedAcross) continue
           const text = String(data[rowIndex]?.[columnIndex] ?? '')
-          const visualLength = Array.from(text.slice(0, 40)).reduce((total, char) => total + (/[^\x00-\xff]/.test(char) ? 2 : 1), 0)
+          // 估算列宽：非 Latin-1 的字符（中日韩、全角标点等）按两个字宽算。
+          // 判据直接查码位而不是 /[^\x00-\xff]/ —— 那个正则里 \x00 是控制字符，
+          // 只是拿来当区间下界，却正是 no-control-regex 要拦的写法，意思也不如码位比较直白。
+          const visualLength = Array.from(text.slice(0, 40)).reduce((total, char) => total + (char.charCodeAt(0) > 0xff ? 2 : 1), 0)
           longest = Math.max(longest, visualLength)
         }
         return Math.max(88, Math.min(240, longest * 7 + 28))
@@ -268,6 +286,9 @@ export function buildExcelBytes(sheets: ExcelSheet[], format: 'xlsx' | 'csv'): {
       workbook.Sheets[sheet.name] = worksheet
       continue
     }
+    if (sheet.rows > 0 && sheet.columns > 0) {
+      worksheet['!ref'] = `A1:${XLSX.utils.encode_cell({ r: sheet.rows - 1, c: sheet.columns - 1 })}`
+    }
     // merges 存的是相对 range 起点的偏移（见 parseExcelFile），aoa_to_sheet 从头开始排，
     // 所以偏移可以直接当绝对坐标用，不需要再加 startRow / startCol。
     worksheet['!merges'] = sheet.merges.map((merge) => ({
@@ -292,14 +313,79 @@ export function buildExcelBytes(sheets: ExcelSheet[], format: 'xlsx' | 'csv'): {
 /**
  * 解析 Word 文档
  */
-export async function parseWordDocument(dataUrl: string): Promise<WordDocument> {
+function normalizeWordHeadings(html: string, documentName: string): string {
+  if (!documentName.trim()) return html
+  const parsed = new DOMParser().parseFromString(html, 'text/html')
+  const body = parsed.body
+  const title = documentName.replace(/\.docx?$/i, '').trim()
+  if (!title) return html
+  const normalizeText = (value: string) => value.replace(/\s+/g, '').toLocaleLowerCase()
+  const titleKey = normalizeText(title)
+  const firstBlock = Array.from(body.children).find((element) => /^(P|H[1-6])$/.test(element.tagName))
+  const existingHeadings = body.querySelector('h1, h2, h3, h4, h5, h6')
+  const titleHeadingExists = Array.from(body.querySelectorAll('h1')).some((heading) => normalizeText(heading.textContent || '') === titleKey)
+  const firstBlockMatchesTitle = Boolean(firstBlock && normalizeText(firstBlock.textContent || '') === titleKey)
+
+  if (firstBlock && firstBlockMatchesTitle && firstBlock.tagName !== 'H1') {
+    const heading = parsed.createElement('h1')
+    heading.innerHTML = firstBlock.innerHTML
+    firstBlock.replaceWith(heading)
+  } else if (title && !titleHeadingExists && !firstBlockMatchesTitle) {
+    const heading = parsed.createElement('h1')
+    heading.textContent = title
+    body.insertBefore(heading, body.firstChild)
+  }
+
+  if (!existingHeadings) {
+    const numberedHeading = /^(?:第[零〇一二三四五六七八九十百千万\d]+[章节篇部分]\s*.+|\d+(?:\.\d+){0,5}(?:[.、．]\s*|\s+)\S.{0,78}|[一二三四五六七八九十]+[、．.]\s*\S.{0,78}|[（(][一二三四五六七八九十\d]+[）)]\s*\S.{0,78})$/
+    for (const paragraph of Array.from(body.children).filter((element) => element.tagName === 'P')) {
+      const text = paragraph.textContent?.trim() || ''
+      const match = text.match(/^第[零〇一二三四五六七八九十百千万\d]+[章节篇部分]/)
+        || text.match(/^(\d+(?:\.\d+)*)(?:[.、．]|\s+)/)
+        || text.match(/^([一二三四五六七八九十]+)[、．.]/)
+        || text.match(/^[（(]([一二三四五六七八九十\d]+)[）)]/)
+      if (!numberedHeading.test(text) || !match || /[。！？；;]$/.test(text)) continue
+      const depth = /^\d/.test(match[1] || '')
+        ? Math.min(6, (match[1].match(/\./g) || []).length + 1)
+        : /^[（(]/.test(text) ? 2 : 1
+      const heading = parsed.createElement(`h${depth}`)
+      heading.innerHTML = paragraph.innerHTML
+      paragraph.replaceWith(heading)
+    }
+  }
+
+  return body.innerHTML
+}
+
+export async function parseWordDocument(dataUrl: string, documentName = ''): Promise<WordDocument> {
   try {
     const arrayBuffer = await extractBinaryFrom(dataUrl)
-    const result = await mammoth.convertToHtml({ arrayBuffer })
-    
+    const result = await mammoth.convertToHtml({ arrayBuffer }, {
+      styleMap: [
+        "p[style-name='标题'] => h1:fresh",
+        "p[style-name='标题 1'] => h1:fresh",
+        "p[style-name='标题1'] => h1:fresh",
+        "p[style-name='一级标题'] => h1:fresh",
+        "p[style-name='标题 2'] => h2:fresh",
+        "p[style-name='标题2'] => h2:fresh",
+        "p[style-name='二级标题'] => h2:fresh",
+        "p[style-name='标题 3'] => h3:fresh",
+        "p[style-name='标题3'] => h3:fresh",
+        "p[style-name='三级标题'] => h3:fresh",
+        "p[style-name='标题 4'] => h4:fresh",
+        "p[style-name='标题4'] => h4:fresh",
+        "p[style-name='标题 5'] => h5:fresh",
+        "p[style-name='标题5'] => h5:fresh",
+        "p[style-name='标题 6'] => h6:fresh",
+        "p[style-name='标题6'] => h6:fresh",
+        "p[style-name='Title'] => h1:fresh",
+        "p[style-name='Subtitle'] => h2:fresh",
+      ],
+    })
+    const html = normalizeWordHeadings(result.value, documentName)
     return {
-      html: result.value,
-      text: result.value.replace(/<[^>]*>/g, '').trim(),
+      html,
+      text: html.replace(/<[^>]*>/g, '').trim(),
     }
   } catch (error) {
     console.error('Failed to parse Word document:', error)
@@ -432,24 +518,42 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#039;')
 }
 
+export function createWordDocumentFromPlainText(text: string): WordDocument {
+  const html = text.split(/\r\n?|\n/).map((line) => `<p>${line ? escapeHtml(line) : '<br>'}</p>`).join('')
+  return { html, text }
+}
+
 /**
  * 创建 Word 文档的预览 HTML，应用样式
  */
 export function createWordPreviewHtml(doc: WordDocument): string {
   // 添加样式以确保 Word 内容渲染正确
   return `
-    <article class="word-preview mx-auto min-h-130 max-w-205 rounded-xl border border-slate-200 bg-white px-6 py-10 text-slate-800 sm:px-10 md:px-14">
+    <article class="word-preview mx-auto min-h-130 max-w-205 bg-white px-6 py-10 text-slate-800 sm:px-10 md:px-14">
       <style>
         .word-content {
           font-size: 15px;
           line-height: 1.8;
+          overflow-wrap: anywhere;
         }
         .word-content h1 { margin: 0 0 1.75rem; font-size: 2rem; font-weight: 600; line-height: 1.25; }
         .word-content h2 { margin: 2.5rem 0 1rem; border-bottom: 1px solid #e5e7eb; padding-bottom: .5rem; font-size: 1.5rem; font-weight: 600; line-height: 1.4; }
         .word-content h3 { margin: 2rem 0 .75rem; font-size: 1.2rem; font-weight: 600; line-height: 1.4; }
+        .word-content h4 { margin: 1.75rem 0 .625rem; font-size: 1.1rem; font-weight: 600; line-height: 1.45; }
+        .word-content h5 { margin: 1.5rem 0 .5rem; font-size: 1rem; font-weight: 600; line-height: 1.5; }
+        .word-content h6 { margin: 1.25rem 0 .5rem; font-size: .95rem; font-weight: 600; line-height: 1.5; color: #475569; }
         .word-content p { margin: 1.25rem 0; }
-        .word-content ul, .word-content ol { margin: 1.25rem 0; padding-left: 1.75rem; }
-        .word-content li { margin: .25rem 0; padding-left: .25rem; }
+        .word-content ul, .word-content ol { margin: 1rem 0; padding-left: 1.75rem; }
+        .word-content ul { list-style-type: disc; }
+        .word-content ol { list-style-type: decimal; }
+        .word-content ul ul { list-style-type: circle; }
+        .word-content ul ul ul { list-style-type: square; }
+        .word-content ol ol { list-style-type: lower-alpha; }
+        .word-content ol ol ol { list-style-type: lower-roman; }
+        .word-content li { margin: .35rem 0; padding-left: .25rem; }
+        .word-content li::marker { color: #4f7cff; }
+        .word-content li > p { margin: .25rem 0; }
+        .word-content li > ul, .word-content li > ol { margin: .25rem 0; }
         .word-content table { width: 100%; margin: 1.5rem 0; border-collapse: collapse; font-size: .9rem; }
         .word-content table th, .word-content table td { border: 1px solid #e5e7eb; padding: .75rem; text-align: left; vertical-align: top; }
         .word-content table th { background-color: #f9fafb; font-weight: 600; }

@@ -3,6 +3,8 @@
 // 并把 v1 信封 `{code,message,data,requestId}` 统一翻译回调用方仍在用的 `{success,data,error}`，
 // 让 requestStore / contentAsset / Knowledge 这类快照调用方**不必改判读逻辑**。
 import { V1_BASE, KNOWLEDGE_BASE } from './apiBase'
+import type { SavedFolder, SavedRequest } from './requestStore'
+import type { RequestBodyConfig } from './requestBody'
 
 // /api/proxy 与本次迁移无关（ApiTest 页的代理回放通道），保持原样。
 export const PROXY_API_URL = '/api/proxy'
@@ -79,7 +81,7 @@ export async function proxyRequest(targetUrl: string, options: ProxyRequestOptio
 }
 
 // 统一的 v1 请求：带 Bearer 头，401 时清态跳登录。返回原生 Response，由调用方决定如何读。
-async function v1Fetch(path: string, init: RequestInit = {}): Promise<Response> {
+export async function v1Fetch(path: string, init: RequestInit = {}): Promise<Response> {
   const token = localStorage.getItem('access_token')
   const response = await fetch(`${V1_BASE}${path}`, {
     ...init,
@@ -215,7 +217,7 @@ export async function apiRequestWithProgress<T = unknown>(action: 'get' | 'set',
 export interface KnowledgeAnswer {
   answer: string
   model: string
-  citations: Array<{ id: number; title: string; path?: string; updated?: string }>
+  citations: Array<{ id: number; title: string; path?: string; updated?: string; url?: string; source?: 'internet' }>
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
 }
 
@@ -236,7 +238,7 @@ export interface KnowledgeAskScope {
 export interface KnowledgeChatMessage {
   role: 'user' | 'assistant'
   text: string
-  citations?: Array<{ id: number; title: string; path?: string; updated?: string }>
+  citations?: Array<{ id: number; title: string; path?: string; updated?: string; url?: string; source?: 'internet' }>
   createdAt?: string
 }
 
@@ -248,9 +250,9 @@ export interface KnowledgeConversation {
   updatedAt: string
 }
 
-export async function askKnowledge(libraryId: number, question: string, history: Array<{ role: 'user' | 'assistant'; text: string }> = [], signal?: AbortSignal, scope?: KnowledgeAskScope): Promise<ApiDataResponse<KnowledgeAnswer>> {
+export async function askKnowledge(libraryId: number, question: string, history: Array<{ role: 'user' | 'assistant'; text: string }> = [], signal?: AbortSignal, scope?: KnowledgeAskScope, webSearch = false): Promise<ApiDataResponse<KnowledgeAnswer>> {
   const token = localStorage.getItem('access_token')
-  const body = JSON.stringify(scope ? { libraryId, question, history, scope } : { libraryId, question, history })
+  const body = JSON.stringify({ libraryId, question, history, ...(scope ? { scope } : {}), webSearch })
   const waitBeforeRetry = () => new Promise<void>((resolve, reject) => {
     const timer = window.setTimeout(resolve, 1200)
     signal?.addEventListener('abort', () => {
@@ -370,7 +372,7 @@ export async function saveDocumentConversations(libraryId: number, name: string,
 // 这里刻意用单文档接口而不是整份 workspace 的读-改-写：文档独立页是一个新标签页，手里没有列表页的
 // workspace 状态，而服务端对 contents 是按 content_key 做 diff（载荷里没有的就删除），
 // 整份回传会把另一个标签页在此期间新增的文档一并删掉。
-export async function replaceContentAsset(contentKey: string, payload: { src: string; mimeType: string; size: number }): Promise<ApiDataResponse<{ contentUpdatedAt?: string }>> {
+export async function replaceContentAsset(contentKey: string, payload: { src: string; mimeType: string; size: number; name?: string }): Promise<ApiDataResponse<{ contentUpdatedAt?: string; name?: string }>> {
   if (!contentKey) return { success: false, error: '缺少文档标识' }
   try {
     const response = await knowledgeConversationsFetch(`${KNOWLEDGE_BASE}/contents/${encodeURIComponent(contentKey)}/asset`, {
@@ -379,10 +381,11 @@ export async function replaceContentAsset(contentKey: string, payload: { src: st
     })
     if (response.status === 404 || response.status === 405) return { success: false, error: '当前后端版本尚不支持文档编辑，请升级后端服务' }
     if (response.status === 413) return { success: false, error: '文件超过服务端允许的大小（96 MB）' }
+    if (response.status === 409) return { success: false, error: '同一文件夹中已存在该 .docx 文件名，请先重命名现有文件' }
     if (!response.ok) return { success: false, error: `保存失败（${response.status}）` }
-    let result: V1Envelope<{ contentUpdatedAt?: string }>
+    let result: V1Envelope<{ contentUpdatedAt?: string; name?: string }>
     try {
-      result = await response.json() as V1Envelope<{ contentUpdatedAt?: string }>
+      result = await response.json() as V1Envelope<{ contentUpdatedAt?: string; name?: string }>
     } catch {
       return { success: false, error: '文档保存服务响应异常，请确认后端已升级' }
     }
@@ -390,6 +393,338 @@ export async function replaceContentAsset(contentKey: string, payload: { src: st
   } catch (error) {
     console.error('[api] replace content asset failed', error)
     return { success: false, error: '无法连接知识库服务' }
+  }
+}
+
+export async function getLegacyWordText(contentKey: string): Promise<ApiDataResponse<{ text: string }>> {
+  if (!contentKey) return { success: false, error: '缺少文档标识' }
+  try {
+    const response = await knowledgeConversationsFetch(`${KNOWLEDGE_BASE}/contents/${encodeURIComponent(contentKey)}/legacy-word-text`, { method: 'GET' })
+    let payload: V1Envelope<{ text: string }> | undefined
+    try {
+      payload = await response.json() as V1Envelope<{ text: string }>
+    } catch {
+      return { success: false, error: `文档解析服务响应异常（${response.status}）` }
+    }
+    return response.ok && payload?.code === 0 && typeof payload.data?.text === 'string'
+      ? { success: true, data: payload.data }
+      : { success: false, error: payload?.message || `文档解析失败（${response.status}）` }
+  } catch (error) {
+    console.error('[api] legacy Word document parse failed', error)
+    return { success: false, error: '无法连接知识库服务' }
+  }
+}
+
+// ───────────────────────── 共享知识库（全员只读 + 指定用户只读） ─────────────────────────
+
+export interface SharedKnowledgeLibrary {
+  id: number
+  name: string
+  icon: string
+  description: string
+  type: 'shared'
+  count: number
+  ownerId: number
+  ownerName: string
+  permission: 'read'
+}
+
+export interface SharedKnowledgeWorkspace {
+  libraries: SharedKnowledgeLibrary[]
+  contents: Record<number, unknown[]>
+}
+
+export interface KnowledgeShareEntry {
+  shareId: number
+  libraryId: number
+  libraryName: string
+  granteeType: 'everyone' | 'user'
+  permission: 'read'
+  createdAt: string
+  // granteeType='user' 时后端返回被授权人；全员行为 null。
+  granteeUserId?: number | null
+  granteeName?: string | null
+  ownerId?: number
+  ownerName?: string
+}
+
+// 共享对象候选（GET /knowledge/share-candidates）：管理员可选所有启用用户，
+// 普通用户仅可选启用的普通用户；都不含请求者自己。orgNodeId 为 null 表示未分配。
+export interface ShareCandidate {
+  id: number
+  username: string
+  nickname: string
+  orgNodeId: number | null
+}
+
+// 组织架构轻量索引（与候选名单同一个响应）。扁平结构，parentId 为 0 的是根节点。
+// 不调 GET /org 取它是刻意的：那条路由仅管理员可用，而分享知识库的是普通用户。
+export interface ShareOrgNode {
+  id: number
+  name: string
+  parentId: number
+}
+
+export interface KnowledgeShareList {
+  outgoing: KnowledgeShareEntry[]
+  incoming: KnowledgeShareEntry[]
+}
+
+export interface ApiTestFolderShareEntry {
+  shareId: number
+  folderId: string
+  folderName: string
+  collection: string
+  granteeUserId: number
+  granteeName: string
+  editStatus: 'none' | 'pending' | 'approved' | 'rejected'
+  createdAt: string
+}
+
+export interface SharedApiTestFolder {
+  shareId: number
+  folderId: string
+  folderName: string
+  collection: string
+  rootPath: string
+  ownerId: number
+  ownerName: string
+  editStatus: 'none' | 'pending' | 'approved' | 'rejected'
+  folders: SavedFolder[]
+  requests: SavedRequest[]
+}
+
+export interface SharedFolderRequest {
+  id: string
+  label: string
+  method: string
+  url: string
+  headers: { key: string; value: string; enabled: boolean }[]
+  auth?: SavedRequest['auth']
+  body: string
+  bodyConfig?: RequestBodyConfig
+  collection: string
+  parent?: string
+  savedAt: string
+  lastResponse?: SavedRequest['lastResponse']
+  concurrentResults?: SavedRequest['concurrentResults']
+  concurrentSummary?: SavedRequest['concurrentSummary']
+  concurrentConfig?: SavedRequest['concurrentConfig']
+}
+
+export interface ApiTestFolderShareList {
+  outgoing: ApiTestFolderShareEntry[]
+  incoming: SharedApiTestFolder[]
+}
+
+export async function listApiTestFolderShares(): Promise<ApiDataResponse<ApiTestFolderShareList>> {
+  try {
+    const response = await v1Fetch('/api-tests/folder-shares')
+    if (!response.ok) return { success: false, error: `请求失败（${response.status}）` }
+    const payload = await readJson<ApiTestFolderShareList>(response)
+    return toDataResponse<ApiTestFolderShareList>(payload)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] API test folder shares list failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+export async function listApiTestFolderShareCandidates(): Promise<ApiDataResponse<{ users: ShareCandidate[]; nodes: ShareOrgNode[] }>> {
+  try {
+    const response = await v1Fetch('/api-tests/folder-shares/candidates')
+    if (!response.ok) return { success: false, error: `请求失败（${response.status}）` }
+    const payload = await readJson<{ users: ShareCandidate[]; nodes: ShareOrgNode[] }>(response)
+    return toDataResponse(payload)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] API test folder share candidates list failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+export async function createApiTestFolderShares(
+  folderId: string,
+  granteeUserIds: number[],
+): Promise<ApiDataResponse<{ created: number; ignored: number }>> {
+  try {
+    const response = await v1Fetch('/api-tests/folder-shares', {
+      method: 'POST',
+      body: JSON.stringify({ folderId, granteeUserIds }),
+    })
+    const payload = await readJson<{ created: number; ignored: number }>(response)
+    return toDataResponse(payload, `共享失败（${response.status}）`)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] create API test folder shares failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+export async function revokeApiTestFolderShare(shareId: number): Promise<ApiDataResponse> {
+  try {
+    const response = await v1Fetch(`/api-tests/folder-shares/${encodeURIComponent(String(shareId))}`, { method: 'DELETE' })
+    const payload = await readJson(response)
+    return toDataResponse(payload, `取消共享失败（${response.status}）`)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] revoke API test folder share failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+async function apiTestFolderShareAction<T>(path: string, method: string, data?: unknown): Promise<ApiDataResponse<T>> {
+  try {
+    const response = await v1Fetch(path, {
+      method,
+      ...(data === undefined ? {} : { body: JSON.stringify(data) }),
+    })
+    const payload = await readJson<T>(response)
+    return toDataResponse(payload, `操作失败（${response.status}）`)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error(`[api] API test folder share action ${method} ${path} failed`, error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+export const requestApiTestFolderEdit = (shareId: number) =>
+  apiTestFolderShareAction(`/api-tests/folder-shares/${shareId}/edit-request`, 'POST')
+
+export const setApiTestFolderEditStatus = (
+  shareId: number,
+  editStatus: 'approved' | 'rejected' | 'none',
+) => apiTestFolderShareAction(`/api-tests/folder-shares/${shareId}/edit-status`, 'PATCH', { editStatus })
+
+export const createSharedApiTestRequest = (shareId: number, request: Partial<SharedFolderRequest>) =>
+  apiTestFolderShareAction<{ id: string }>(`/api-tests/folder-shares/${shareId}/requests`, 'POST', request)
+
+export const updateSharedApiTestRequest = (
+  shareId: number,
+  requestId: string,
+  request: Partial<SharedFolderRequest>,
+) => apiTestFolderShareAction<{ id?: string }>(`/api-tests/folder-shares/${shareId}/requests/${encodeURIComponent(requestId)}`, 'PUT', request)
+
+export const deleteSharedApiTestRequest = (shareId: number, requestId: string) =>
+  apiTestFolderShareAction(`/api-tests/folder-shares/${shareId}/requests/${encodeURIComponent(requestId)}`, 'DELETE')
+
+export const createSharedApiTestFolder = (shareId: number, name: string, parent: string) =>
+  apiTestFolderShareAction<{ id: string }>(`/api-tests/folder-shares/${shareId}/folders`, 'POST', { name, parent })
+
+export const renameSharedApiTestFolder = (shareId: number, folderId: string, name: string) =>
+  apiTestFolderShareAction(`/api-tests/folder-shares/${shareId}/folders/${encodeURIComponent(folderId)}`, 'PATCH', { name })
+
+export const setSharedApiTestFolderBaseUrl = (shareId: number, folderId: string, baseUrl: string) =>
+  apiTestFolderShareAction(`/api-tests/folder-shares/${shareId}/folders/${encodeURIComponent(folderId)}`, 'PATCH', { baseUrl })
+
+export const deleteSharedApiTestFolder = (shareId: number, folderId: string) =>
+  apiTestFolderShareAction(`/api-tests/folder-shares/${shareId}/folders/${encodeURIComponent(folderId)}`, 'DELETE')
+
+// 读取当前用户收到的共享库快照（后端 GET /knowledge/shared/workspace）。
+// 与私有工作区刻意不同形：无 groups/messages/revision，条目恒 hasAsset、无 src。
+export async function getSharedKnowledgeWorkspace(): Promise<ApiDataResponse<SharedKnowledgeWorkspace>> {
+  try {
+    const response = await v1Fetch('/knowledge/shared/workspace')
+    if (!response.ok) return { success: false, error: `请求失败（${response.status}）` }
+    const payload = await readJson<SharedKnowledgeWorkspace>(response)
+    return toDataResponse<SharedKnowledgeWorkspace>(payload)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] shared knowledge workspace get failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+// 保存共享库的读者侧排序（后端 PUT /knowledge/shared/order）。
+// 提交**完整有序 id 列表**（整份状态语义）：后端整份替换，所以每次拖拽整份发不会累积误差。
+// 共享库是别人的库 —— 这份顺序只影响本人侧栏的展示，不写 owner 的任何数据。
+export async function saveSharedLibraryOrder(order: number[]): Promise<ApiDataResponse<{ count: number }>> {
+  try {
+    const response = await v1Fetch('/knowledge/shared/order', {
+      method: 'PUT',
+      body: JSON.stringify({ order }),
+    })
+    const payload = await readJson<{ count: number }>(response)
+    return toDataResponse<{ count: number }>(payload, `共享库顺序保存失败（${response.status}）`)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] shared library order save failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+export async function listKnowledgeShares(): Promise<ApiDataResponse<KnowledgeShareList>> {
+  try {
+    const response = await v1Fetch('/knowledge/shares')
+    if (!response.ok) return { success: false, error: `请求失败（${response.status}）` }
+    const payload = await readJson<KnowledgeShareList>(response)
+    return toDataResponse<KnowledgeShareList>(payload)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] knowledge shares list failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+// 共享一个自有库给全员。409 KNOWLEDGE_SHARE_DUPLICATED 时 code 透传给调用方区分处理。
+export async function createKnowledgeShare(libraryId: number): Promise<ApiDataResponse<{ shareId: number }>> {
+  try {
+    const response = await v1Fetch('/knowledge/shares', {
+      method: 'POST',
+      body: JSON.stringify({ libraryId, granteeType: 'everyone' }),
+    })
+    const payload = await readJson<{ shareId: number }>(response)
+    return toDataResponse<{ shareId: number }>(payload, `共享失败（${response.status}）`)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] create knowledge share failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+export async function revokeKnowledgeShare(shareId: number): Promise<ApiDataResponse> {
+  try {
+    const response = await v1Fetch(`/knowledge/shares/${encodeURIComponent(String(shareId))}`, { method: 'DELETE' })
+    const payload = await readJson(response)
+    return toDataResponse(payload, `取消共享失败（${response.status}）`)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] revoke knowledge share failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+// 共享对象候选名单（弹窗"指定用户"的数据源）。失败静默返回空列表由调用方降级。
+export async function listShareCandidates(): Promise<ApiDataResponse<{ users: ShareCandidate[]; nodes: ShareOrgNode[] }>> {
+  try {
+    const response = await v1Fetch('/knowledge/share-candidates')
+    if (!response.ok) return { success: false, error: `请求失败（${response.status}）` }
+    const payload = await readJson<{ users: ShareCandidate[]; nodes: ShareOrgNode[] }>(response)
+    return toDataResponse<{ users: ShareCandidate[]; nodes: ShareOrgNode[] }>(payload)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] share candidates list failed', error)
+    return { success: false, error: 'network error' }
+  }
+}
+
+// 把自有库点名共享给多个用户（多选，批量）。后端语义是"保存勾选集合"：
+// 已存在的授权静默跳过（data.ignored），不报 409，因此调用方无需特殊分支处理重复提交。
+export async function createUserKnowledgeShares(
+  libraryId: number,
+  granteeUserIds: number[]
+): Promise<ApiDataResponse<{ created: number; ignored: number }>> {
+  try {
+    const response = await v1Fetch('/knowledge/shares', {
+      method: 'POST',
+      body: JSON.stringify({ libraryId, granteeType: 'user', granteeUserIds }),
+    })
+    const payload = await readJson<{ created: number; ignored: number }>(response)
+    return toDataResponse<{ created: number; ignored: number }>(payload, `共享失败（${response.status}）`)
+  } catch (error) {
+    if (error instanceof UnauthorizedError) return { success: false, error: error.message }
+    console.error('[api] create user knowledge shares failed', error)
+    return { success: false, error: 'network error' }
   }
 }
 

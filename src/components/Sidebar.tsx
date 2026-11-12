@@ -21,13 +21,23 @@ const menuItems = [
     ),
   },
   {
-    permission: 'knowledge' as ModulePermission,
+    permission: 'ai' as ModulePermission,
     label: 'AI 问答',
     path: '/ai-chat',
     icon: (
       <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 3 13.8 8.2 19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z" />
         <path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" />
+      </svg>
+    ),
+  },
+  {
+    permission: 'ai' as ModulePermission,
+    label: '任务中心',
+    path: '/tasks',
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M9 6h11M9 12h11M9 18h11" /><path d="m3 6 1 1 2-2M3 12l1 1 2-2M3 18l1 1 2-2" />
       </svg>
     ),
   },
@@ -138,7 +148,7 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
       {/* 导航菜单 */}
       <nav className="flex-1 pt-3">
         <ul className="menu w-full gap-1.5 px-3 md:px-2 xl:px-3">
-          {menuItems.filter((item) => item.permission === 'knowledge' || user?.permissions?.includes(item.permission)).map((item) => (
+          {menuItems.filter((item) => user?.permissions?.includes(item.permission)).map((item) => (
             <li key={item.path} className="w-full">
               <NavLink
                 to={item.path}

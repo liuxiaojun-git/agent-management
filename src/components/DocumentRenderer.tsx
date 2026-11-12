@@ -1,11 +1,14 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useId } from 'react'
+import { createPortal } from 'react-dom'
 import {
   parseExcelFile,
   parseWordDocument,
+  createWordDocumentFromPlainText,
   createExcelPreviewHtml,
   createMarkdownPreviewHtml,
   createWordPreviewHtml,
 } from '../utils/documentRenderer'
+import { getLegacyWordText } from '../utils/api'
 
 interface ContentItem {
   id: string
@@ -30,6 +33,7 @@ interface DocumentRendererProps {
   onPageCountChange?: (pageCount: number) => void
   /** 当前滚动位置对应的 Word 页码。 */
   onCurrentPageChange?: (page: number) => void
+  onTocChange?: (entries: Array<{ id: string; text: string; level: number }>) => void
 }
 
 // Markdown 预览的排版规则。文档编辑器的分栏预览要和只读预览一致，所以单独导出复用。
@@ -38,17 +42,93 @@ export const markdownTypographyClassName = 'text-[15px] leading-7 text-base-cont
 // 只读预览的整页外框。编辑器里的分栏预览不用它 —— min-h / max-w 是整页尺寸，塞进分栏会撑出滚动条。
 export const markdownPreviewClassName = `markdown-preview mx-auto min-h-130 max-w-205 bg-base-100 px-6 py-10 sm:px-10 md:px-14 ${markdownTypographyClassName}`
 
-export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange, onCurrentPageChange }: DocumentRendererProps) {
+export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange, onCurrentPageChange, onTocChange }: DocumentRendererProps) {
+  const headingIdPrefix = useId().replace(/:/g, '')
   // 初值为 true：组件挂载时文件还没水合完，先显示解析中的占位，避免闪一帧「无法加载文档内容」。
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [htmlContent, setHtmlContent] = useState('')
   const [textContent, setTextContent] = useState<string | null>(null)
+  const [activeImage, setActiveImage] = useState<{ src: string; alt: string } | null>(null)
+  const imageTriggerRef = useRef<HTMLImageElement | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const root = containerRef.current
+    if (!root) {
+      onTocChange?.([])
+      return
+    }
+    const links = Array.from(root.querySelectorAll<HTMLElement>('.markdown-preview h1, .markdown-preview h2, .markdown-preview h3, .word-content h1, .word-content h2, .word-content h3, .word-content h4, .word-content h5, .word-content h6'))
+    links.forEach((heading, index) => { heading.id = `preview-heading-${headingIdPrefix}-${index}` })
+    onTocChange?.(links.map((heading, index) => ({ id: heading.id, text: heading.textContent?.trim() || `章节 ${index + 1}`, level: Number(heading.tagName.slice(1)) })))
+  }, [htmlContent, loading, onTocChange, headingIdPrefix])
+
+  useEffect(() => {
+    const root = containerRef.current
+    if (!root || loading) return
+
+    const prepareImages = () => {
+      root.querySelectorAll<HTMLImageElement>('img').forEach((image) => {
+        image.tabIndex = 0
+        image.setAttribute('role', 'button')
+        image.setAttribute('aria-label', image.alt ? `放大查看图片：${image.alt}` : '放大查看图片')
+        image.style.cursor = 'zoom-in'
+      })
+    }
+
+    const openImage = (image: HTMLImageElement) => {
+      if (!image.src) return
+      imageTriggerRef.current = image
+      setActiveImage({ src: image.src, alt: image.alt })
+    }
+    const handleClick = (event: MouseEvent) => {
+      const target = event.target
+      if (!(target instanceof Element)) return
+      const image = target.closest<HTMLImageElement>('img')
+      if (!image || !root.contains(image)) return
+      event.preventDefault()
+      event.stopPropagation()
+      openImage(image)
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      const target = event.target
+      if (!(target instanceof Element)) return
+      const image = target.closest<HTMLImageElement>('img')
+      if (!image || !root.contains(image)) return
+      event.preventDefault()
+      openImage(image)
+    }
+
+    prepareImages()
+    const observer = new MutationObserver(prepareImages)
+    observer.observe(root, { childList: true, subtree: true })
+    root.addEventListener('click', handleClick)
+    root.addEventListener('keydown', handleKeyDown)
+    return () => {
+      observer.disconnect()
+      root.removeEventListener('click', handleClick)
+      root.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [htmlContent, loading])
+
+  useEffect(() => {
+    if (!activeImage) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setActiveImage(null)
+        requestAnimationFrame(() => imageTriggerRef.current?.focus())
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [activeImage])
 
   // 类型判定放在渲染期：未托管的类型不能停在 loading 占位，而「是否托管」是个纯计算，不该靠 effect 里的 setState 表达。
   const isExcel = /\.(xlsx?|csv)$/i.test(item.name)
   const isWord = /\.(docx?)$/i.test(item.name)
+  const isLegacyWord = /\.doc$/i.test(item.name)
   const isMarkdown = /\.(md|markdown)$/i.test(item.name) || item.mimeType === 'text/markdown'
   const isText = !isExcel && (/\.(txt|md|markdown|json|xml|html?)$/i.test(item.name) || item.mimeType?.startsWith('text/'))
   const handled = isExcel || isWord || isText
@@ -56,7 +136,7 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
   useEffect(() => {
     // 还没有可读地址（水合中）——保持 loading 占位。
     // 本组件不负责的类型直接返回，交给外层的「无法加载文档内容」兜底。
-    if (!src || !handled) return
+    if ((!src && !isLegacyWord) || !handled) return
 
     let cancelled = false
 
@@ -69,6 +149,7 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
         onLoadingChange?.(true)
 
         if (isText) {
+          if (!src) throw new Error('文件内容不可用')
           const response = await fetch(src)
           if (!response.ok) throw new Error(`文本读取失败（${response.status}）`)
           const text = await response.text()
@@ -76,12 +157,21 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
           if (isMarkdown) setHtmlContent(createMarkdownPreviewHtml(text))
           else setTextContent(text)
         } else if (isExcel) {
+          if (!src) throw new Error('文件内容不可用')
           const parsedSheets = await parseExcelFile(src)
           if (cancelled) return
           const html = createExcelPreviewHtml(parsedSheets)
           setHtmlContent(html)
         } else if (isWord) {
-          const doc = await parseWordDocument(src)
+          let doc
+          if (isLegacyWord) {
+            const result = await getLegacyWordText(item.id)
+            if (!result.success || !result.data) throw new Error(result.error || '旧版 .doc 文档解析失败')
+            doc = createWordDocumentFromPlainText(result.data.text)
+          } else {
+            if (!src) throw new Error('文件内容不可用')
+            doc = await parseWordDocument(src, item.name)
+          }
           if (cancelled) return
           const html = createWordPreviewHtml(doc)
           setHtmlContent(html)
@@ -104,7 +194,7 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
     return () => {
       cancelled = true
     }
-  }, [src, handled, isExcel, isWord, isMarkdown, isText, onLoadingChange])
+  }, [item.id, item.name, src, handled, isExcel, isWord, isLegacyWord, isMarkdown, isText, onLoadingChange])
 
   // 为 Excel 表格标签页添加事件监听
   useEffect(() => {
@@ -205,9 +295,11 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
       const existingPages = Array.from(content.querySelectorAll<HTMLElement>(':scope > .word-page'))
       if (content.dataset.pageKey !== pageKey || existingPages.length === 0) {
         const sourceHtml = content.dataset.sourceHtml ?? content.innerHTML
-        content.dataset.sourceHtml = sourceHtml
         content.dataset.pageKey = pageKey
         content.innerHTML = sourceHtml
+        const headings = Array.from(content.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6'))
+        headings.forEach((heading, index) => { heading.id = `preview-heading-${headingIdPrefix}-${index}` })
+        content.dataset.sourceHtml = content.innerHTML
         const blocks = Array.from(content.childNodes)
         content.replaceChildren()
         Object.assign(content.style, { display: 'flex', flexDirection: 'column', gap: '1.5rem' })
@@ -241,19 +333,26 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
         pageCount = pages.length
         pages.forEach((pageElement, index) => {
           const footer = document.createElement('footer')
-          footer.textContent = `第 ${index + 1} / ${pageCount} 页`
           Object.assign(footer.style, {
             position: 'absolute',
-          right: '0',
-          bottom: '1rem',
-          left: '0',
+            right: '2.5rem',
+            bottom: '1.25rem',
+            left: '2.5rem',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
             borderTop: '1px solid #e2e8f0',
-            paddingTop: '.5rem',
-            textAlign: 'center',
+            paddingTop: '.75rem',
             color: '#94a3b8',
-            fontSize: '11px',
-            lineHeight: '1',
+            fontSize: '10px',
+            lineHeight: '1.4',
           })
+          const brand = document.createElement('span')
+          brand.textContent = '智域知识库'
+          const pageNumber = document.createElement('span')
+          pageNumber.textContent = `${index + 1} / ${pageCount}`
+          Object.assign(pageNumber.style, { color: '#64748b', fontVariantNumeric: 'tabular-nums' })
+          footer.append(brand, pageNumber)
           pageElement.appendChild(footer)
         })
       } else {
@@ -294,7 +393,7 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
     }
     // loading 必须在依赖里：解析中渲染的是 loading 占位而不是容器，此时 containerRef 还是空的。
     // 少了它，分页只会在「容器未挂载」的那一次跑一遍就再也不重跑，Word 预览会丢掉分页。
-  }, [htmlContent, loading, item.name, onCurrentPageChange, onPageCountChange])
+  }, [htmlContent, loading, item.name, onCurrentPageChange, onPageCountChange, headingIdPrefix])
 
   // Excel 单元格选择：显示名称框和当前单元格内容。
   useEffect(() => {
@@ -325,7 +424,7 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
   }, [htmlContent])
 
   // 托管类型且还没拿到地址 / 还在解析 → 占位；未托管的类型直接落到下面的兜底文案。
-  if (handled && (loading || !src)) {
+  if (handled && (loading || (!src && !isLegacyWord))) {
     return (
       <div className="mx-auto flex min-h-130 max-w-205 items-center justify-center rounded-xl border border-base-300 bg-base-100 text-sm text-base-content/45">
         <div className="text-center">
@@ -368,7 +467,40 @@ export function DocumentRenderer({ item, src, onLoadingChange, onPageCountChange
     )
   }
 
-  return <div ref={containerRef} className={isMarkdown ? markdownPreviewClassName : 'mx-auto w-full min-w-0 max-w-none'} dangerouslySetInnerHTML={{ __html: htmlContent }} />
+  const closeImagePreview = () => {
+    setActiveImage(null)
+    requestAnimationFrame(() => imageTriggerRef.current?.focus())
+  }
+
+  return <>
+    <div ref={containerRef} className={isMarkdown ? markdownPreviewClassName : 'mx-auto w-full min-w-0 max-w-none'} dangerouslySetInnerHTML={{ __html: htmlContent }} />
+    {activeImage ? createPortal(
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="图片预览"
+        className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 p-6"
+        onClick={closeImagePreview}
+      >
+        <button
+          type="button"
+          autoFocus
+          onClick={closeImagePreview}
+          className="absolute right-5 top-5 rounded-lg bg-white/10 px-4 py-2 text-sm text-white transition hover:bg-white/20 focus:outline-2 focus:outline-offset-2 focus:outline-white"
+          aria-label="关闭图片预览"
+        >关闭</button>
+        <figure className="m-0 flex max-h-full max-w-full flex-col items-center" onClick={(event) => event.stopPropagation()}>
+          <img
+            src={activeImage.src}
+            alt={activeImage.alt || '文档图片放大预览'}
+            className="max-h-[90vh] max-w-[94vw] object-contain"
+          />
+          {activeImage.alt ? <figcaption className="mt-3 max-w-[90vw] text-center text-sm text-white/80">{activeImage.alt}</figcaption> : null}
+        </figure>
+      </div>,
+      document.body,
+    ) : null}
+  </>
 }
 
 export default DocumentRenderer

@@ -1,18 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { CHAT_MODEL_KEY, type ChatConversation, type ChatFile, type ChatMessage, type ChatModel, buildTitleFromPrompt, createBackendConversation, createConversation, createConversationId, deleteBackendConversation, getBackendConversations, getBackendMessages, getModels, saveSelectedModel, stopChat, streamChat, uploadChatFile } from '../services/chatService'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { CHAT_MODEL_KEY, type ChatConversation, type ChatFile, type ChatMessage, type ChatModel, type PersonalTaskInput, buildTitleFromPrompt, createBackendConversation, createBackendTasks, createConversation, createConversationId, deleteBackendConversation, getBackendConversation, getBackendConversations, getBackendMessages, getModels, saveSelectedModel, stopChat, streamChat, uploadChatFile } from '../services/chatService'
 import { clearLogCache } from '../utils/logStore'
 import { renderAssistantBlocks } from '../utils/assistantMarkdown'
 // 与知识库同一套操作外观：⋯ 浮层菜单、弹窗、图标。
 import { Dialog, DialogActions, DialogError, DialogField, DialogHeader, Icon, MenuAction, RowMenuPopover, RowMenuTrigger } from '../components/OperationUI'
 import { menuIcons, useRowMenu } from '../components/operationMenu'
-
-const quickPrompts = [
-  '帮我写一份产品需求',
-  '帮我分析一份数据',
-  '帮我优化一段文案',
-  '帮我总结一篇文章',
-  '帮我制定一个工作计划',
-]
+import PromptTemplateDialog from '../components/PromptTemplateDialog'
+import TaskImportDialog from '../components/TaskImportDialog'
+import { promptTemplates } from '../utils/promptTemplates'
+import { extractOpenTasks } from '../utils/taskExtraction'
 
 function formatTime(date: string) {
   return new Date(date).toLocaleString('zh-CN', {
@@ -51,8 +48,15 @@ async function copyMessage(text: string) {
 }
 
 export default function AiChatPage() {
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const sourceConversationId = searchParams.get('conversationId') || ''
+  const sourceMessageId = searchParams.get('messageId') || ''
   const [conversations, setConversations] = useState<ChatConversation[]>([])
   const [activeConversationId, setActiveConversationId] = useState<string>('')
+  const [sourceError, setSourceError] = useState('')
+  const [sourceMessagesLoaded, setSourceMessagesLoaded] = useState(false)
+  const [highlightedSourceMessageId, setHighlightedSourceMessageId] = useState('')
   const [prompt, setPrompt] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
   const [models, setModels] = useState<ChatModel[]>([])
@@ -66,6 +70,9 @@ export default function AiChatPage() {
   const [renamingConversation, setRenamingConversation] = useState<ChatConversation | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [renameError, setRenameError] = useState('')
+  const [promptTemplateOpen, setPromptTemplateOpen] = useState(false)
+  const [promptTemplateInitialId, setPromptTemplateInitialId] = useState('')
+  const [taskImport, setTaskImport] = useState<{ conversationId: string; messageId: string; tasks: string[] } | null>(null)
   // 没选模型时不再用 window.alert 打断：那条提示就地显示在输入框上方，改完模型发下一条就消失。
   const [sendHint, setSendHint] = useState('')
   const [searchText, setSearchText] = useState('')
@@ -78,6 +85,7 @@ export default function AiChatPage() {
   const abortControllerRef = useRef<AbortController | null>(null)
   const currentMessageIdRef = useRef('')
   const currentConversationIdRef = useRef('')
+  const sourceScrollKeyRef = useRef('')
 
   const activeConversation = useMemo(
     () => conversations.find((item) => item.id === activeConversationId) ?? null,
@@ -92,10 +100,38 @@ export default function AiChatPage() {
   }, [])
 
   useEffect(() => {
-    void getBackendConversations().then((list) => {
+    sourceScrollKeyRef.current = ''
+    void getBackendConversations().then(async (initialList) => {
+      let list = initialList
+      let sourceConversation: ChatConversation | undefined
+      if (sourceConversationId && sourceMessageId) {
+        sourceConversation = list.find((item) => item.backendId === sourceConversationId)
+        if (!sourceConversation) {
+          try {
+            sourceConversation = await getBackendConversation(sourceConversationId)
+            list = [sourceConversation, ...list]
+          } catch (error) {
+            setConversations(list)
+            setActiveConversationId('')
+            setSourceError(error instanceof Error ? `加载来源对话失败：${error.message}` : '加载来源对话失败。')
+            return
+          }
+        }
+      }
       setConversations(list)
-      setActiveConversationId((current) => current || list[0]?.id || '')
-    }).catch(() => setConversations([]))
+      if (sourceConversationId && sourceMessageId) {
+        if (sourceConversation) {
+          setActiveConversationId(sourceConversation.id)
+        }
+      } else {
+        setActiveConversationId((current) => current || list[0]?.id || '')
+      }
+    }).catch((error) => {
+      setConversations([])
+      if (sourceConversationId && sourceMessageId) {
+        setSourceError(error instanceof Error ? `加载来源对话失败：${error.message}` : '加载来源对话失败。')
+      }
+    })
     void getModels().then((list) => {
       setModelLoadError('')
       setModels(list)
@@ -118,23 +154,49 @@ export default function AiChatPage() {
       setModels([])
       setModelLoadError(error instanceof Error ? error.message : '无法连接模型服务')
     })
-  }, [])
+  }, [sourceConversationId, sourceMessageId])
 
   useEffect(() => {
     const conversation = conversations.find((item) => item.id === activeConversationId)
-    if (!conversation || conversation.messages.length > 0 || !conversation.backendId) return
-    void getBackendMessages(conversation.backendId).then((messages) => {
+    if (!conversation || !conversation.backendId) return
+    if (conversation.messages.length > 0) return
+    void getBackendMessages(
+      conversation.backendId,
+      conversation.backendId === sourceConversationId ? sourceMessageId : undefined,
+    ).then((messages) => {
       updateConversation({ ...conversation, messages })
-    }).catch(() => undefined)
-  }, [activeConversationId, conversations, updateConversation])
+      if (conversation.backendId === sourceConversationId) setSourceMessagesLoaded(true)
+    }).catch((error) => {
+      if (conversation.backendId === sourceConversationId && sourceMessageId) {
+        setSourceError(error instanceof Error ? `加载来源消息失败：${error.message}` : '加载来源消息失败。')
+        setSourceMessagesLoaded(true)
+      }
+    })
+  }, [activeConversationId, conversations, sourceConversationId, sourceMessageId, updateConversation])
 
   useEffect(() => {
     conversationsRef.current = conversations
   }, [conversations])
 
   useEffect(() => {
+    if (sourceConversationId && sourceMessageId) return
     endOfMessagesRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [activeConversation?.messages.length, isGenerating])
+  }, [activeConversation?.messages.length, isGenerating, sourceConversationId, sourceMessageId])
+
+  useEffect(() => {
+    if (!sourceConversationId || !sourceMessageId
+      || (!sourceMessagesLoaded && !activeConversation?.messages.length)
+      || !activeConversation) return
+    const sourceMessage = activeConversation.messages.find((message) => message.id === sourceMessageId)
+    if (!sourceMessage || sourceMessage.role !== 'assistant') return
+    const scrollKey = `${sourceConversationId}:${sourceMessageId}`
+    if (sourceScrollKeyRef.current === scrollKey) return
+    sourceScrollKeyRef.current = scrollKey
+    setHighlightedSourceMessageId(sourceMessageId)
+    window.requestAnimationFrame(() => {
+      document.getElementById(`chat-message-${sourceMessageId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+  }, [activeConversation, sourceConversationId, sourceMessageId, sourceMessagesLoaded])
 
   useEffect(() => {
     const textarea = textareaRef.current
@@ -153,6 +215,13 @@ export default function AiChatPage() {
   }
 
   const selectConversation = (id: string) => {
+    if (sourceConversationId || sourceMessageId) {
+      setSearchParams({}, { replace: true })
+      setSourceError('')
+      setSourceMessagesLoaded(false)
+      setHighlightedSourceMessageId('')
+      sourceScrollKeyRef.current = ''
+    }
     // 切换会话时收起未完成的内联编辑，避免编辑态残留到其他会话
     setEditingMessageId('')
     setPrompt('')
@@ -316,6 +385,47 @@ export default function AiChatPage() {
     }
   }
 
+  const handleExtractTasks = (message: ChatMessage) => {
+    const latestMessage = activeConversation?.messages[activeConversation.messages.length - 1]
+    if (
+      isGenerating
+      || latestMessage?.id !== message.id
+      || message.role !== 'assistant'
+      || message.status === 'streaming'
+      || message.status === 'failed'
+      || message.status === 'stopped'
+    ) return
+
+    const extractionPrompt = '请将你刚才的回答整理为可执行的待办清单。只提取回答中明确提出或直接支持的行动项，不推测负责人、截止日期或目标；缺少的信息标注“待确认”。以 Markdown 复选框列表呈现，每项简洁、可执行，并附上可检查的完成标准；没有可执行事项时请明确说明。'
+    setPrompt((current) => current.trimEnd()
+      ? `${current.trimEnd()}\n\n${extractionPrompt}`
+      : extractionPrompt)
+    window.requestAnimationFrame(() => textareaRef.current?.focus())
+  }
+
+  const openTaskImport = (message: ChatMessage, conversation: ChatConversation) => {
+    const extractedTasks = extractOpenTasks(message.content)
+    if (!conversation.backendId || extractedTasks.length === 0) return
+    setTaskImport({
+      conversationId: conversation.backendId,
+      messageId: message.id,
+      tasks: extractedTasks,
+    })
+  }
+
+  const saveExtractedTasks = async (tasks: PersonalTaskInput[]) => {
+    if (!taskImport) return { skipped: 0 }
+    const result = await createBackendTasks(tasks, {
+      conversationId: taskImport.conversationId,
+      messageId: taskImport.messageId,
+    })
+    if (!result.skipped) {
+      setTaskImport(null)
+      navigate('/tasks')
+    }
+    return result
+  }
+
   const handleDeleteConversation = (id: string) => {
     const target = conversations.find((item) => item.id === id)
     if (target?.backendId) void deleteBackendConversation(target.backendId).catch(() => undefined)
@@ -378,8 +488,19 @@ export default function AiChatPage() {
 
   const selectedModel = models.find((model) => model.id === selectedModelId) || models[0]
   const selectedModelName = selectedModel?.name || '未选择'
+  const sourceMessageMissing = Boolean(
+    sourceConversationId
+    && sourceMessageId
+    && (sourceMessagesLoaded || Boolean(activeConversation?.messages.length))
+    && activeConversation
+    && !activeConversation.messages.some((message) => message.id === sourceMessageId && message.role === 'assistant'),
+  )
+  const openPromptTemplates = (templateId = '') => {
+    setPromptTemplateInitialId(templateId)
+    setPromptTemplateOpen(true)
+  }
 
-  if (models.length === 0) {
+  if (models.length === 0 && !(sourceConversationId && sourceMessageId)) {
     return (
       <div className="flex h-[calc(100vh-4rem)] items-center justify-center rounded-2xl border border-base-300/60 bg-base-100 shadow-sm">
         <div className="text-center">
@@ -396,6 +517,11 @@ export default function AiChatPage() {
       <div className="mb-6 shrink-0">
         <h1 className="text-2xl font-bold">AI 问答</h1>
       </div>
+      {sourceError || sourceMessageMissing ? (
+        <div className="alert alert-warning mb-3 py-2 text-sm" role="alert">
+          {sourceError || '找不到这条任务对应的 AI 回答；该回答可能已删除或不可访问。'}
+        </div>
+      ) : null}
       <div className="flex min-h-0 flex-1 overflow-hidden rounded-2xl border border-base-300/60 bg-base-100 shadow-sm">
       <aside className="hidden w-72 shrink-0 border-r border-base-300/60 bg-base-200/30 p-4 md:flex md:flex-col">
         <div className="mb-4 flex items-center justify-between">
@@ -456,14 +582,16 @@ export default function AiChatPage() {
                 <h1 className="text-3xl font-bold">你好，我是你的 AI 工作搭档</h1>
                 <p className="mt-3 text-base text-base-content/60">有什么工作需要我帮你？</p>
                 <div className="mt-8 grid gap-3 sm:grid-cols-2">
-                  {quickPrompts.map((promptText) => (
+                  {promptTemplates.map((template) => (
                     <button
-                      key={promptText}
+                      key={template.id}
                       type="button"
-                      onClick={() => setPrompt(promptText)}
+                      onClick={() => openPromptTemplates(template.id)}
                       className="rounded-xl border border-base-300 bg-base-200/40 px-4 py-3 text-left text-sm text-base-content/70 transition hover:border-primary/50 hover:bg-primary/5"
                     >
-                      {promptText}
+                      <span className="mb-1 block text-[10px] font-medium text-primary">{template.category}</span>
+                      <span className="block font-medium text-base-content/80">{template.title}</span>
+                      <span className="mt-1 block text-xs text-base-content/50">{template.description}</span>
                     </button>
                   ))}
                 </div>
@@ -472,7 +600,7 @@ export default function AiChatPage() {
           ) : (
             <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-8">
               <div className="mx-auto max-w-4xl space-y-5">
-                {activeConversation.messages.map((message) =>
+                {activeConversation.messages.map((message, messageIndex) =>
                   message.role === 'user' && editingMessageId === message.id ? (
                     <div key={message.id} className="group/message flex justify-end">
                       <div className="flex w-full min-w-0 flex-col items-start">
@@ -486,7 +614,11 @@ export default function AiChatPage() {
                       </div>
                     </div>
                   ) : (
-                  <div key={message.id} className={`group/message flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div
+                    key={message.id}
+                    id={`chat-message-${message.id}`}
+                    className={`group/message flex rounded-xl ${message.role === 'user' ? 'justify-end' : 'justify-start'} ${highlightedSourceMessageId === message.id ? 'ring-2 ring-primary/50 ring-offset-2 ring-offset-base-100' : ''}`}
+                  >
                     <div className={`flex min-w-0 flex-col ${message.role === 'user' ? 'max-w-[85%] items-end' : 'w-full items-start'}`}>
                       <div className={`text-sm leading-6 ${message.role === 'user' ? 'rounded-3xl bg-base-200 text-base-content' : 'w-full text-base-content'}`}>
                         <div className={message.role === 'user' ? 'px-4 py-2.5' : 'py-1'}>
@@ -507,6 +639,36 @@ export default function AiChatPage() {
                           {copiedMessageId === message.id ? <Icon className="h-3.5 w-3.5"><path d="m5 13 4 4L19 7" /></Icon> : menuIcons.copy}
                           {copiedMessageId === message.id ? <span className="whitespace-nowrap text-xs" role="status" aria-live="polite">复制成功</span> : null}
                         </button>
+                        {message.role === 'assistant'
+                          && messageIndex === activeConversation.messages.length - 1
+                          && (!message.status || message.status === 'completed')
+                          && !isGenerating ? (
+                            <button
+                              type="button"
+                              onClick={() => handleExtractTasks(message)}
+                              className="flex items-center gap-1 rounded-lg p-1.5 text-base-content/55 transition hover:bg-base-200 hover:text-primary"
+                              title="将最新回答整理为任务清单；指令会填入输入框，不会自动发送"
+                              aria-label="从最新回答提取任务"
+                            >
+                              <Icon><path d="M9 6h11M9 12h11M9 18h11" /><path d="m3 6 1 1 2-2M3 12l1 1 2-2M3 18l1 1 2-2" /></Icon>
+                              <span className="text-xs">整理任务</span>
+                            </button>
+                          ) : null}
+                        {message.role === 'assistant'
+                          && message.status === 'completed'
+                          && extractOpenTasks(message.content).length > 0
+                          && activeConversation.backendId ? (
+                            <button
+                              type="button"
+                              onClick={() => openTaskImport(message, activeConversation)}
+                              className="flex items-center gap-1 rounded-lg p-1.5 text-base-content/55 transition hover:bg-base-200 hover:text-primary"
+                              title="检查并添加回答中的待办到任务中心"
+                              aria-label="将回答中的任务添加到任务中心"
+                            >
+                              <Icon><path d="m5 12 4 4L19 6" /><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9" /></Icon>
+                              <span className="text-xs">添加任务</span>
+                            </button>
+                          ) : null}
                         {message.role === 'user' && !isGenerating && (
                           <button type="button" onClick={() => handleEditMessage(message)} className="rounded-lg p-1.5 text-base-content/55 transition hover:bg-base-200 hover:text-base-content" title="编辑消息" aria-label="编辑消息">{menuIcons.edit}</button>
                         )}
@@ -612,6 +774,16 @@ export default function AiChatPage() {
               <div className="flex shrink-0 items-center gap-1">
                 <button
                   type="button"
+                  onClick={() => openPromptTemplates()}
+                  disabled={isGenerating}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2 text-xs text-base-content/55 transition hover:bg-base-200 hover:text-primary disabled:opacity-40"
+                  title="选择系统推荐的提示词模板"
+                >
+                  <Icon><path d="m12 3 1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2L12 3Z" /><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z" /></Icon>
+                  <span>模板</span>
+                </button>
+                <button
+                  type="button"
                   onClick={() => fileInputRef.current?.click()}
                   className="rounded-lg p-2 text-base-content/45 transition hover:bg-base-200 hover:text-base-content"
                   title="上传文件"
@@ -640,6 +812,27 @@ export default function AiChatPage() {
         ) : null}
       </main>
       </div>
+      {promptTemplateOpen ? (
+        <PromptTemplateDialog
+          key={promptTemplateInitialId}
+          initialTemplateId={promptTemplateInitialId}
+          currentPrompt={prompt}
+          onClose={() => setPromptTemplateOpen(false)}
+          onApply={(templatePrompt) => {
+            setPrompt(templatePrompt)
+            setSendHint('')
+            setPromptTemplateOpen(false)
+            window.requestAnimationFrame(() => textareaRef.current?.focus())
+          }}
+        />
+      ) : null}
+      {taskImport ? (
+        <TaskImportDialog
+          extractedTasks={taskImport.tasks}
+          onClose={() => setTaskImport(null)}
+          onSave={saveExtractedTasks}
+        />
+      ) : null}
       {/* 删除确认：副标题带上对话标题。此前只说「这条历史对话」，左侧列表长得都差不多，
           用户没法确认删的是哪一条。 */}
       {deleteConversationId && (() => {

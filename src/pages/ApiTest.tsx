@@ -9,7 +9,25 @@ import { html } from '@codemirror/lang-html'
 import { xml } from '@codemirror/lang-xml'
 import { addLog } from '../utils/logStore'
 import { createRequestGuard } from '../utils/requestGuard.ts'
-import { proxyRequest } from '../utils/api'
+import {
+  proxyRequest,
+  listApiTestFolderShares,
+  listApiTestFolderShareCandidates,
+  createApiTestFolderShares,
+  revokeApiTestFolderShare,
+  requestApiTestFolderEdit,
+  setApiTestFolderEditStatus,
+  createSharedApiTestRequest,
+  updateSharedApiTestRequest,
+  deleteSharedApiTestRequest,
+  createSharedApiTestFolder,
+  renameSharedApiTestFolder,
+  setSharedApiTestFolderBaseUrl,
+  deleteSharedApiTestFolder,
+  type ApiTestFolderShareEntry,
+  type SharedApiTestFolder,
+  type ShareCandidate,
+} from '../utils/api'
 import {
   buildRequestBody,
   createBodyField,
@@ -22,6 +40,8 @@ import {
 } from '../utils/requestBody'
 import {
   getSavedRequests,
+  getActiveRequestId,
+  setActiveRequestId,
   getCollections,
   getFolders,
   setSavedRequests as storeSaveRequests,
@@ -32,6 +52,10 @@ import {
   type SavedFolder,
   type Collection,
 } from '../utils/requestStore'
+import { peekApiDraft, commitApiDraftConsumed, type ApiDraftOrigin, type ApiRequestDraft } from '../utils/apiDraft'
+import { getModels, CHAT_MODEL_KEY, type ChatModel } from '../services/chatService'
+import { analyzeApiResponse, type ApiResponseAnalysisInput, type ApiResponseAnalysisMode, type ApiResponseAnalysisResult } from '../services/apiResponseAnalysis'
+import { renderAssistantBlocks } from '../utils/assistantMarkdown'
 // 树运算与 React 无关，全在 requestTree 里；这里只负责把当前一层的行画出来。
 import {
   MAX_PATH_LENGTH,
@@ -55,11 +79,36 @@ import { menuIcons, useRowMenu } from '../components/operationMenu'
 
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
+// 分析结果的缓存键：请求、响应、模式和模型任一变化都视为新的上下文。
+// 只取正文首尾片段而不是整段正文，避免每次按键都生成超长字符串。
+const apiAnalysisCacheKey = (input: ApiResponseAnalysisInput) => {
+  const req = input.request
+  const res = input.response
+  return [
+    input.mode,
+    input.model || 'default',
+    req.method,
+    req.url,
+    req.body.length,
+    req.body.slice(0, 120),
+    req.body.slice(-120),
+    res.status,
+    res.statusText,
+    res.time,
+    res.size,
+    res.body.length,
+    res.body.slice(0, 120),
+    res.body.slice(-120),
+  ].join('\u0000')
+}
+
 // 请求行的 key 就是请求 id，集合行的 key 得自己加前缀：两边共用一个 openMenuId，
 // 集合名叫 "12"、请求 id 也叫 "12" 时不能撞上。
 const collectionMenuKey = (name: string) => `collection:${name}`
 // 文件夹行的菜单键也走 openMenuId。按 id 而不是路径：改名和移动都不该让一个开着的菜单指向别处。
 const folderMenuKey = (id: string) => `folder:${id}`
+const sharedFolderMenuKey = (shareId: number, id: string) => `shared:${shareId}:folder:${id}`
+const sharedRequestMenuKey = (shareId: number, id: string) => `shared:${shareId}:request:${id}`
 // 右栏顶栏那个「+」的菜单键。同样走 openMenuId，好和行菜单互斥——同一时刻只该有一个浮层开着。
 const newEntryMenuKey = 'new-entry'
 
@@ -99,6 +148,12 @@ interface AuthConfig {
   apiAddTo: 'header' | 'query'
   username: string
   password: string
+}
+
+type DraftSource = {
+  confidence: ApiRequestDraft['confidence']
+  origin: ApiDraftOrigin
+  notices: string[]
 }
 
 const methodColors: Record<HttpMethod, string> = {
@@ -192,18 +247,27 @@ const defaultBodyConfig: RequestBodyConfig = {
 }
 
 export default function ApiTest() {
-  // 有历史记录时默认选中第一条
+  const isAdminUser = (() => {
+    try {
+      const user = JSON.parse(localStorage.getItem('user') || 'null')
+      return user?.role ? user.role === 'admin' : (user?.permissions || []).includes('users')
+    } catch {
+      return false
+    }
+  })()
+  // 刷新时恢复上次打开的请求，不以列表第一条代替用户的选择。
   const initialList = getSavedRequests()
-  const hasHistory = initialList.length > 0
-  const [method, setMethod] = useState<HttpMethod>(hasHistory ? initialList[0].method as HttpMethod : 'POST')
-  const [url, setUrl] = useState(hasHistory ? initialList[0].url : 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions')
+  const initialRequestId = getActiveRequestId()
+  const initialRequest = initialList.find(request => request.id === initialRequestId)
+  const [method, setMethod] = useState<HttpMethod>(initialRequest ? initialRequest.method as HttpMethod : 'POST')
+  const [url, setUrl] = useState(initialRequest ? initialRequest.url : 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions')
   const [activeTab, setActiveTab] = useState<'params' | 'headers' | 'body' | 'auth'>('body')
-  const initialBodyConfig = initialList[0]?.bodyConfig || defaultBodyConfig
+  const initialBodyConfig = initialRequest?.bodyConfig || defaultBodyConfig
   const [bodyMode, setBodyMode] = useState<BodyMode>(initialBodyConfig.mode)
   const [bodyType, setBodyType] = useState<RawBodyType>(initialBodyConfig.rawType)
-  const [headers, setHeaders] = useState<KvPair[]>(hasHistory ? initialList[0].headers.map(h => ({ ...h })) : defaultHeaders.map(h => ({ ...h })))
-    const [auth, setAuth] = useState<AuthConfig>(() => initialList[0]?.auth || defaultAuthConfig)
-  const initBody = hasHistory ? normalizePathSep(initialList[0].body) : defaultBody
+  const [headers, setHeaders] = useState<KvPair[]>(initialRequest ? initialRequest.headers.map(h => ({ ...h })) : defaultHeaders.map(h => ({ ...h })))
+  const [auth, setAuth] = useState<AuthConfig>(() => initialRequest?.auth || defaultAuthConfig)
+  const initBody = initialRequest ? normalizePathSep(initialRequest.body) : defaultBody
   const [body, setBody] = useState(initBody)
   const [bodyFields, setBodyFields] = useState<BodyField[]>(
     () => initialBodyConfig.fields.map(field => ({ ...field })),
@@ -216,14 +280,29 @@ export default function ApiTest() {
   const initialCollections = getCollections()
   const [savedRequests, setSavedRequests] = useState<SavedRequest[]>(() => initialList)
   const [storeHydrated, setStoreHydrated] = useState(false)
-  const [currentSavedId, setCurrentSavedId] = useState<string | null>(null)
-  const [showWelcome, setShowWelcome] = useState(true)
+  const [currentSavedId, setCurrentSavedId] = useState<string | null>(initialRequest?.id || null)
+  const [showWelcome, setShowWelcome] = useState(!initialRequest)
   const [collections, setCollections] = useState<Collection[]>(initialCollections)
-  const initialCurrentCollection = hasHistory && initialCollections.some(c => c.name === initialList[0].collection)
-    ? initialList[0].collection
+  const initialCurrentCollection = initialRequest && initialCollections.some(c => c.name === initialRequest.collection)
+    ? initialRequest.collection
     : initialCollections[0]?.name || '默认集合'
   const [currentCollection, setCurrentCollection] = useState<string>(initialCurrentCollection)
   const [folders, setFolders] = useState<SavedFolder[]>(() => getFolders())
+  const [folderShares, setFolderShares] = useState<ApiTestFolderShareEntry[]>([])
+  const [incomingFolderShares, setIncomingFolderShares] = useState<SharedApiTestFolder[]>([])
+  const [folderShareError, setFolderShareError] = useState<string | null>(null)
+  const [shareDialogFolderId, setShareDialogFolderId] = useState<string | null>(null)
+  const [shareCandidates, setShareCandidates] = useState<ShareCandidate[]>([])
+  const [sharePicked, setSharePicked] = useState<Set<number>>(() => new Set())
+  const [shareBusy, setShareBusy] = useState(false)
+  const [shareError, setShareError] = useState<string | null>(null)
+  const [activeSharedFolderShareId, setActiveSharedFolderShareId] = useState<number | null>(null)
+  const [baseUrlDialog, setBaseUrlDialog] = useState<{ folderId: string; shareId: number | null } | null>(null)
+  const [baseUrlDraft, setBaseUrlDraft] = useState('')
+  const [baseUrlError, setBaseUrlError] = useState('')
+  const [sharedRequestMode, setSharedRequestMode] = useState(false)
+  const [sharedRequestId, setSharedRequestId] = useState<string | null>(null)
+  const [sharedRequestLabel, setSharedRequestLabel] = useState('')
   // 「当前这一层」的路径（集合相对），同时是两件事：右栏正在浏览哪一层、下一条保存落到哪一层。
   // 合成一个而不是拆成 browsePath + savePath：两份状态一旦能不一致，就会出现
   // 「看着 A 文件夹、新请求却存进 B」这种没法解释的现象。
@@ -232,8 +311,23 @@ export default function ApiTest() {
   const rowMenu = useRowMenu()
   const { openMenuId, menuAnchor, panelRef: rowMenuRef, close: closeRowMenu } = rowMenu
 
+  // 知识库问答带入的草稿只在这一会话里显示来源；切换或新建请求即消失。
+  const [draftSource, setDraftSource] = useState<DraftSource | null>(null)
+
+  // AI 响应分析：一次性请求，不创建 AI 会话。模型列表与选中模型独立于 AI 问答页。
+  const [models, setModels] = useState<ChatModel[]>([])
+  const [modelsLoaded, setModelsLoaded] = useState(false)
+  const [analysisDialogOpen, setAnalysisDialogOpen] = useState(false)
+  const [analysisLoading, setAnalysisLoading] = useState(false)
+  const [analysisError, setAnalysisError] = useState<string | null>(null)
+  const [analysisResult, setAnalysisResult] = useState<ApiResponseAnalysisResult | null>(null)
+  const [analysisMode, setAnalysisMode] = useState<ApiResponseAnalysisMode>('explain')
+  const [selectedModelId, setSelectedModelId] = useState<string>('')
+  // 按「请求 + 响应 + 模式 + 模型」缓存分析结果：关闭弹窗后再打开直接复用，不重复请求模型。
+  const analysisCacheRef = useRef(new Map<string, ApiResponseAnalysisResult>())
+
   // 响应
-  const firstResponse = hasHistory ? initialList[0].lastResponse : null
+  const firstResponse = initialRequest?.lastResponse || null
   const [response, setResponse] = useState<{
     status: number
     statusText: string
@@ -249,12 +343,12 @@ export default function ApiTest() {
   const sendGuardRef = useRef(createRequestGuard())
   const [activeResponseTab, setActiveResponseTab] = useState<'body' | 'headers' | 'concurrent'>('body')
   // 并发测试
-  const cfg = hasHistory ? initialList[0].concurrentConfig : null
+  const cfg = initialRequest?.concurrentConfig
   const [concurrentMode, setConcurrentMode] = useState(cfg?.mode ?? false)
   const [concurrentCount, setConcurrentCount] = useState(cfg?.count ?? 5)
   const [concurrentDuration, setConcurrentDuration] = useState(cfg?.duration ?? 10)
   const [requestTimeout, setRequestTimeout] = useState(cfg?.timeout ?? 600)
-  const [concurrentResults, setConcurrentResults] = useState<{ index: number; status: number; time: string; body?: string }[] | null>(() => hasHistory ? (initialList[0].concurrentResults || null) : null)
+  const [concurrentResults, setConcurrentResults] = useState<{ index: number; status: number; time: string; body?: string }[] | null>(() => initialRequest?.concurrentResults || null)
   const [selectedConcurrentResult, setSelectedConcurrentResult] = useState<{ index: number; status: number; time: string; body?: string } | null>(null)
 
   // 切换 body 类型时同步更新 Content-Type 请求头
@@ -313,10 +407,89 @@ export default function ApiTest() {
     }
   }
 
+  const getCurrentFolderBaseUrl = () => {
+    const activeShare = activeSharedFolderShareId == null
+      ? null
+      : incomingFolderShares.find(share => share.shareId === activeSharedFolderShareId) || null
+    const targetFolders = activeShare?.folders || folders
+    const targetCollection = activeShare?.collection || currentCollection
+    const targetPath = normParent(currentPath)
+    return targetPath
+      ? targetFolders
+          .filter(folder =>
+            folder.collection === targetCollection
+            && folder.baseUrl?.trim()
+            && isSelfOrDescendant(targetPath, folderPath(folder)),
+          )
+          .sort((a, b) => folderPath(b).length - folderPath(a).length)[0]?.baseUrl?.trim()
+      : undefined
+  }
+
+  const currentFolderBaseUrl = getCurrentFolderBaseUrl()
+
   const buildRequestUrl = () => {
-    if (auth.type !== 'apiKey' || auth.apiAddTo !== 'query' || !auth.apiKey.trim()) return url
-    const separator = url.includes('?') ? '&' : '?'
-    return `${url}${separator}${encodeURIComponent(auth.apiKey.trim())}=${encodeURIComponent(auth.apiValue)}`
+    const baseUrl = currentFolderBaseUrl
+    const endpoint = url.trim()
+    const resolvedUrl = baseUrl && !/^https?:\/\//i.test(endpoint)
+      ? `${baseUrl.replace(/\/+$/, '')}/${endpoint.replace(/^\/+/, '')}`
+      : endpoint
+    if (auth.type !== 'apiKey' || auth.apiAddTo !== 'query' || !auth.apiKey.trim()) return resolvedUrl
+    const separator = resolvedUrl.includes('?') ? '&' : '?'
+    return `${resolvedUrl}${separator}${encodeURIComponent(auth.apiKey.trim())}=${encodeURIComponent(auth.apiValue)}`
+  }
+
+  const openFolderBaseUrlDialog = (folder: SavedFolder, shareId: number | null = null) => {
+    setBaseUrlDialog({ folderId: folder.id, shareId })
+    setBaseUrlDraft(folder.baseUrl || '')
+    setBaseUrlError('')
+  }
+
+  const saveFolderBaseUrl = async () => {
+    if (!baseUrlDialog) return
+    const value = baseUrlDraft.trim()
+    let normalizedBaseUrl = ''
+    if (value.length > 2048) {
+      setBaseUrlError('Base URL 不能超过 2048 个字符')
+      return
+    }
+    if (value) {
+      try {
+        const parsed = new URL(value)
+        if (!['http:', 'https:'].includes(parsed.protocol) || parsed.search || parsed.hash) {
+          throw new Error('invalid URL')
+        }
+        normalizedBaseUrl = value.replace(/\/+$/, '')
+      } catch {
+        setBaseUrlError('请输入有效的 HTTP 或 HTTPS Base URL，且不要包含查询参数或片段')
+        return
+      }
+    }
+
+    if (baseUrlDialog.shareId == null) {
+      if (!folders.some(folder => folder.id === baseUrlDialog.folderId)) {
+        setBaseUrlError('文件夹已不存在，请关闭后重试')
+        return
+      }
+      setFolders(previous => previous.map(folder =>
+        folder.id === baseUrlDialog.folderId
+          ? { ...folder, baseUrl: normalizedBaseUrl || undefined }
+          : folder,
+      ))
+    } else {
+      const result = await setSharedApiTestFolderBaseUrl(
+        baseUrlDialog.shareId,
+        baseUrlDialog.folderId,
+        normalizedBaseUrl,
+      )
+      if (!result.success) {
+        setBaseUrlError(result.error || '保存 Base URL 失败')
+        return
+      }
+      await refreshFolderShares()
+    }
+
+    setBaseUrlDialog(null)
+    showToast('✅ Base URL 已保存')
   }
 
   const updateBodyField = (id: string, update: Partial<BodyField>) => {
@@ -460,6 +633,9 @@ export default function ApiTest() {
     }
     setSavedRequests(prev => [newReq, ...prev])
     setCurrentSavedId(newReq.id)
+    setActiveRequestId(newReq.id)
+    setSharedRequestMode(false)
+    setActiveSharedFolderShareId(null)
     showToast('✅ 保存成功')
     setCurrentCollection(saveCollection)
     setCurrentPath(saveParent)
@@ -617,39 +793,68 @@ export default function ApiTest() {
           setSavedRequests([])
           setCollections(persisted.collections)
           setCurrentCollection(persisted.collections[0]?.name || '默认集合')
+          setCurrentPath(null)
+          setCurrentSavedId(null)
+          setShowWelcome(true)
+          setActiveRequestId(null)
           return
         }
 
-        const first = persisted.requests[0]
         setSavedRequests(persisted.requests)
         setCollections(persisted.collections)
-        setMethod(first.method as HttpMethod)
-        setUrl(first.url)
-        setHeaders(first.headers.map(h => ({ ...h })))
-        setAuth(first.auth || defaultAuthConfig)
-        setBody(normalizePathSep(first.body))
-        const persistedBody = first.bodyConfig || defaultBodyConfig
+        const selected = persisted.requests.find(request => request.id === getActiveRequestId())
+        if (!selected) {
+          setCurrentCollection(persisted.collections[0]?.name || '默认集合')
+          setCurrentPath(null)
+          setCurrentSavedId(null)
+          setShowWelcome(true)
+          setActiveRequestId(null)
+          setMethod('POST')
+          setUrl('https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions')
+          setHeaders(defaultHeaders.map(header => ({ ...header })))
+          setAuth(defaultAuthConfig)
+          setBody(defaultBody)
+          setBodyMode(defaultBodyConfig.mode)
+          setBodyType(defaultBodyConfig.rawType)
+          setBodyFields(defaultBodyConfig.fields.map(field => ({ ...field })))
+          setBinaryBody(defaultBodyConfig.binary)
+          setGraphqlQuery(defaultBodyConfig.graphqlQuery)
+          setGraphqlVariables(defaultBodyConfig.graphqlVariables)
+          setResponse(null)
+          setConcurrentMode(false)
+          setConcurrentCount(5)
+          setConcurrentDuration(10)
+          setRequestTimeout(600)
+          setConcurrentResults(null)
+          return
+        }
+
+        setMethod(selected.method as HttpMethod)
+        setUrl(selected.url)
+        setHeaders(selected.headers.map(h => ({ ...h })))
+        setAuth(selected.auth || defaultAuthConfig)
+        setBody(normalizePathSep(selected.body))
+        const persistedBody = selected.bodyConfig || defaultBodyConfig
         setBodyMode(persistedBody.mode)
         setBodyType(persistedBody.rawType)
         setBodyFields(persistedBody.fields.map(field => ({ ...field })))
         setBinaryBody(persistedBody.binary)
         setGraphqlQuery(persistedBody.graphqlQuery)
         setGraphqlVariables(persistedBody.graphqlVariables)
-        setResponse(first.lastResponse || null)
-        setConcurrentMode(first.concurrentConfig?.mode ?? false)
-        setConcurrentCount(first.concurrentConfig?.count ?? 5)
-        setConcurrentDuration(first.concurrentConfig?.duration ?? 10)
-        setRequestTimeout(first.concurrentConfig?.timeout ?? 600)
-        setConcurrentResults(first.concurrentResults || null)
+        setResponse(selected.lastResponse || null)
+        setConcurrentMode(selected.concurrentConfig?.mode ?? false)
+        setConcurrentCount(selected.concurrentConfig?.count ?? 5)
+        setConcurrentDuration(selected.concurrentConfig?.duration ?? 10)
+        setRequestTimeout(selected.concurrentConfig?.timeout ?? 600)
+        setConcurrentResults(selected.concurrentResults || null)
         setCurrentCollection(
-          persisted.collections.some(c => c.name === first.collection)
-            ? first.collection
+          persisted.collections.some(c => c.name === selected.collection)
+            ? selected.collection
             : persisted.collections[0]?.name || '默认集合'
         )
-        // 编辑器里已经装上第一条请求了，右栏就得停在同一层、把同一行标出来。
-        // 不给 currentPath 的话，首条请求埋在文件夹里时，右栏画的是根层，看不见它。
-        setCurrentSavedId(first.id)
-        setCurrentPath(normParent(first.parent))
+        setCurrentSavedId(selected.id)
+        setCurrentPath(normParent(selected.parent))
+        setShowWelcome(false)
       } catch {
         // 忽略恢复失败，保留当前已加载的状态
       } finally {
@@ -665,10 +870,230 @@ export default function ApiTest() {
   const getModelName = () => { try { return JSON.parse(body).model || '' } catch { return '' } }
   const nowStr = () => { const d = new Date(); return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}` }
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToast(msg)
     setTimeout(() => setToast(null), 2000)
+  }, [])
+
+  const refreshFolderShares = useCallback(async () => {
+    const result = await listApiTestFolderShares()
+    if (!result.success || !result.data) {
+      setFolderShareError(result.error || '共享信息加载失败')
+      return false
+    }
+    setFolderShares(result.data.outgoing)
+    setIncomingFolderShares(result.data.incoming)
+    setFolderShareError(null)
+    return true
+  }, [])
+
+  const openFolderShareDialog = async (folder: SavedFolder) => {
+    closeRowMenu()
+    setShareDialogFolderId(folder.id)
+    setSharePicked(new Set())
+    setShareCandidates([])
+    setShareError(null)
+    const [sharesResult, candidatesResult] = await Promise.all([
+      listApiTestFolderShares(),
+      listApiTestFolderShareCandidates(),
+    ])
+    if (sharesResult.success && sharesResult.data) {
+      setFolderShares(sharesResult.data.outgoing)
+      setIncomingFolderShares(sharesResult.data.incoming)
+      setFolderShareError(null)
+    } else {
+      setShareError(sharesResult.error || '共享信息加载失败')
+    }
+    if (candidatesResult.success && candidatesResult.data) {
+      setShareCandidates(candidatesResult.data.users)
+    } else {
+      setShareError(candidatesResult.error || '用户列表加载失败')
+    }
   }
+
+  const saveFolderShares = async () => {
+    if (!shareDialogFolderId || shareBusy) return
+    const alreadySharedIds = new Set(
+      folderShares.filter(entry => entry.folderId === shareDialogFolderId).map(entry => entry.granteeUserId),
+    )
+    const pending = [...sharePicked].filter(id => !alreadySharedIds.has(id))
+    if (!pending.length) return
+    setShareBusy(true)
+    setShareError(null)
+    const result = await createApiTestFolderShares(shareDialogFolderId, pending)
+    setShareBusy(false)
+    if (!result.success) {
+      setShareError(result.error || '共享失败')
+      return
+    }
+    setSharePicked(new Set())
+    await refreshFolderShares()
+  }
+
+  const revokeFolderShare = async (entry: ApiTestFolderShareEntry) => {
+    if (shareBusy) return
+    setShareBusy(true)
+    setShareError(null)
+    const result = await revokeApiTestFolderShare(entry.shareId)
+    setShareBusy(false)
+    if (!result.success) {
+      setShareError(result.error || '取消共享失败')
+      return
+    }
+    await refreshFolderShares()
+  }
+
+  const requestSharedFolderEdit = async (share: SharedApiTestFolder) => {
+    const result = await requestApiTestFolderEdit(share.shareId)
+    if (!result.success) {
+      showToast(`⚠️ ${result.error || '编辑申请失败'}`)
+      return
+    }
+    showToast('✅ 编辑申请已提交，等待所有者审批')
+    await refreshFolderShares()
+  }
+
+  const updateFolderEditAccess = async (
+    shareId: number,
+    editStatus: 'approved' | 'rejected' | 'none',
+  ) => {
+    setShareBusy(true)
+    const result = await setApiTestFolderEditStatus(shareId, editStatus)
+    setShareBusy(false)
+    if (!result.success) {
+      setShareError(result.error || '编辑权限更新失败')
+      return
+    }
+    await refreshFolderShares()
+  }
+
+  const sharedRequestPayload = (
+    responseToSave = response,
+    resultsToSave = concurrentResults,
+  ) => {
+    const summary = calcConcurrentSummary(resultsToSave, responseToSave)
+    return {
+      label: sharedRequestLabel || url.split('/').pop()?.split('?')[0]?.split('.')[0] || '未命名',
+      method,
+      url,
+      headers: headers.map(header => ({ ...header })),
+      auth: { ...auth },
+      body,
+      bodyConfig: getBodyConfig(),
+      savedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
+      ...(responseToSave ? { lastResponse: { ...responseToSave } } : {}),
+      ...(resultsToSave ? { concurrentResults: resultsToSave } : {}),
+      ...(summary ? { concurrentSummary: summary } : {}),
+      concurrentConfig: { mode: concurrentMode, count: concurrentCount, duration: concurrentDuration, timeout: requestTimeout },
+    }
+  }
+
+  const persistSharedRequest = async (
+    responseToSave = response,
+    resultsToSave = concurrentResults,
+  ) => {
+    if (!activeSharedFolder || activeSharedFolder.editStatus !== 'approved') return false
+    const payload = sharedRequestPayload(responseToSave, resultsToSave)
+    const result = sharedRequestId
+      ? await updateSharedApiTestRequest(activeSharedFolder.shareId, sharedRequestId, payload)
+      : await createSharedApiTestRequest(activeSharedFolder.shareId, { ...payload, parent: browsePath || activeSharedRootPath || undefined })
+    if (!result.success) {
+      showToast(`⚠️ ${result.error || '共享请求保存失败'}`)
+      return false
+    }
+    if (!sharedRequestId && result.data?.id) setSharedRequestId(result.data.id)
+    setSharedRequestLabel(payload.label)
+    await refreshFolderShares()
+    showToast('✅ 共享请求已保存')
+    return true
+  }
+
+  const createSharedSubfolder = async () => {
+    if (!activeSharedFolder || activeSharedFolder.editStatus !== 'approved') return
+    const name = window.prompt('请输入新文件夹名称')
+    if (!name?.trim()) return
+    const result = await createSharedApiTestFolder(
+      activeSharedFolder.shareId,
+      name.trim(),
+      browsePath || activeSharedRootPath || '',
+    )
+    if (!result.success) {
+      showToast(`⚠️ ${result.error || '创建文件夹失败'}`)
+      return
+    }
+    await refreshFolderShares()
+    showToast('✅ 文件夹已创建')
+  }
+
+  const renameSharedSubfolder = async (folder: SavedFolder) => {
+    if (!activeSharedFolder || activeSharedFolder.editStatus !== 'approved') return
+    const name = window.prompt('请输入新的文件夹名称', folder.name)
+    if (!name?.trim() || name.trim() === folder.name) return
+    const result = await renameSharedApiTestFolder(activeSharedFolder.shareId, folder.id, name.trim())
+    if (!result.success) {
+      showToast(`⚠️ ${result.error || '重命名文件夹失败'}`)
+      return
+    }
+    await refreshFolderShares()
+  }
+
+  const deleteSharedSubfolder = async (folder: SavedFolder) => {
+    if (!activeSharedFolder || activeSharedFolder.editStatus !== 'approved') return
+    if (!window.confirm(`删除文件夹“${folder.name}”及其全部子内容？`)) return
+    const result = await deleteSharedApiTestFolder(activeSharedFolder.shareId, folder.id)
+    if (!result.success) {
+      showToast(`⚠️ ${result.error || '删除文件夹失败'}`)
+      return
+    }
+    if (browsePath === folderPath(folder) || browsePath?.startsWith(`${folderPath(folder)}/`)) {
+      setCurrentPath(activeSharedFolder.rootPath)
+    }
+    await refreshFolderShares()
+  }
+
+  const deleteSharedRequest = async (request: SavedRequest) => {
+    if (!activeSharedFolder || activeSharedFolder.editStatus !== 'approved') return
+    if (!window.confirm(`删除请求“${request.label}”？`)) return
+    const result = await deleteSharedApiTestRequest(activeSharedFolder.shareId, request.id)
+    if (!result.success) {
+      showToast(`⚠️ ${result.error || '删除请求失败'}`)
+      return
+    }
+    if (sharedRequestId === request.id) {
+      setSharedRequestId(null)
+      setCurrentSavedId(null)
+      setSharedRequestMode(false)
+    }
+    await refreshFolderShares()
+  }
+
+  const renameSharedRequest = async (request: SavedRequest) => {
+    if (!activeSharedFolder || activeSharedFolder.editStatus !== 'approved') return
+    const label = window.prompt('请输入新的请求名称', request.label)
+    if (!label?.trim() || label.trim() === request.label) return
+    const result = await updateSharedApiTestRequest(activeSharedFolder.shareId, request.id, {
+      ...request,
+      label: label.trim(),
+    })
+    if (!result.success) {
+      showToast(`⚠️ ${result.error || '重命名请求失败'}`)
+      return
+    }
+    await refreshFolderShares()
+  }
+
+  const startNewSharedRequest = () => {
+    if (!activeSharedFolder || activeSharedFolder.editStatus !== 'approved') return
+    startNewRequest(activeSharedFolder.collection, browsePath || activeSharedRootPath)
+    setActiveSharedFolderShareId(activeSharedFolder.shareId)
+    setSharedRequestMode(true)
+    setSharedRequestId(null)
+    setSharedRequestLabel('')
+  }
+
+  useEffect(() => {
+    void refreshFolderShares()
+  }, [refreshFolderShares])
 
   const isValidCollectionName = (value: string) => /^[\p{L}\p{N}\s_-]+$/u.test(value)
 
@@ -853,7 +1278,10 @@ export default function ApiTest() {
 
     setFolders(prev => prev.filter(f => !killedFolderIds.includes(f.id)))
     setSavedRequests(prev => prev.filter(r => !killedRequests.some(k => k.id === r.id)))
-    if (currentSavedId && killedRequests.some(r => r.id === currentSavedId)) setCurrentSavedId(null)
+    if (currentSavedId && killedRequests.some(r => r.id === currentSavedId)) {
+      setCurrentSavedId(null)
+      setActiveRequestId(null)
+    }
     // 站位落在被删的子树里就退回父层，否则 currentPath 会指向一个不存在的路径，
     // 下次保存写进去的 parent 渲染不出来，请求等于凭空消失。
     if (isSelfOrDescendant(normParent(currentPath), path)) {
@@ -989,6 +1417,7 @@ export default function ApiTest() {
     setFolders(prev => prev.filter(f => f.collection !== name))
     if (currentSavedId && requestsToDelete.some(request => request.id === currentSavedId)) {
       setCurrentSavedId(null)
+      setActiveRequestId(null)
     }
     if (currentCollection === name) {
       setCurrentCollection(remainingCollections[0].name)
@@ -1017,6 +1446,9 @@ export default function ApiTest() {
     setCurrentCollection(collection)
     setCurrentPath(parent)
     setCurrentSavedId(null)
+    setActiveRequestId(null)
+    setActiveSharedFolderShareId(null)
+    setSharedRequestMode(false)
     setResponse(null)
     setConcurrentResults(null)
     setSelectedConcurrentResult(null)
@@ -1024,9 +1456,139 @@ export default function ApiTest() {
     setConcurrentCount(5)
     setConcurrentDuration(10)
     setRequestTimeout(30)
+    setDraftSource(null)
     setShowWelcome(false)
     showToast('✨ 新建请求')
   }
+
+  // 知识库问答带入的草稿：只预填，是否发送由用户确认。
+  const applyApiDraft = useCallback((draft: ApiRequestDraft) => {
+    setMethod(draft.method)
+    setUrl(draft.url)
+    setHeaders(draft.headers?.length
+      ? draft.headers.map(header => ({ ...header }))
+      : [])
+    setAuth(draft.auth ? { ...draft.auth } : { ...defaultAuthConfig })
+    setBody(draft.body ?? '')
+    setBodyMode(draft.bodyConfig?.mode ?? 'raw')
+    setBodyType(draft.bodyConfig?.rawType ?? 'json')
+    setBodyFields(draft.bodyConfig?.fields?.map(field => ({ ...field })) ?? [createBodyField()])
+    setBinaryBody(draft.bodyConfig?.binary ?? null)
+    setGraphqlQuery(draft.bodyConfig?.graphqlQuery ?? defaultBodyConfig.graphqlQuery)
+    setGraphqlVariables(draft.bodyConfig?.graphqlVariables ?? defaultBodyConfig.graphqlVariables)
+    setWrapBody(false)
+    setCurrentSavedId(null)
+    setActiveRequestId(null)
+    setActiveSharedFolderShareId(null)
+    setSharedRequestMode(false)
+    setSharedRequestId(null)
+    setResponse(null)
+    setConcurrentResults(null)
+    setSelectedConcurrentResult(null)
+    setConcurrentMode(false)
+    setDraftSource({ confidence: draft.confidence, origin: draft.origin, notices: draft.notices ?? [] })
+    setShowWelcome(false)
+  }, [])
+
+  // 必须等工作区 hydrate 完成再消费：否则会被「恢复上次打开的请求」覆盖。
+  const incomingDraftApplied = useRef(false)
+  useEffect(() => {
+    if (!storeHydrated || incomingDraftApplied.current) return
+    incomingDraftApplied.current = true
+    const draft = peekApiDraft()
+    if (!draft) return
+    applyApiDraft(draft)
+    commitApiDraftConsumed()
+    showToast('已从知识库问答带入请求，请确认后发送')
+  }, [storeHydrated, applyApiDraft, showToast])
+
+  // 加载可用模型，用于响应 AI 分析；失败不阻塞主流程。
+  useEffect(() => {
+    let mounted = true
+    void getModels()
+      .then((list) => {
+        if (!mounted) return
+        setModels(list)
+        setModelsLoaded(true)
+        const saved = localStorage.getItem(CHAT_MODEL_KEY)
+        try {
+          const parsed = JSON.parse(saved || '{}') as { selectedModelId?: string }
+          if (parsed.selectedModelId && list.some((model) => model.id === parsed.selectedModelId)) {
+            setSelectedModelId(parsed.selectedModelId)
+          } else if (list.length) {
+            setSelectedModelId(list[0].id)
+          }
+        } catch {
+          if (list.length) setSelectedModelId(list[0].id)
+        }
+      })
+      .catch(() => {
+        if (!mounted) return
+        setModelsLoaded(true)
+      })
+    return () => { mounted = false }
+  }, [])
+
+  const analysisInput = useMemo<ApiResponseAnalysisInput | null>(() => {
+    if (!response) return null
+    return {
+      mode: analysisMode,
+      ...(selectedModelId ? { model: selectedModelId } : {}),
+      request: { method, url, headers, authType: auth.type, body },
+      response: {
+        status: response.status,
+        statusText: response.statusText,
+        time: response.time,
+        size: response.size,
+        headers: response.headers,
+        body: response.body,
+      },
+    }
+  }, [method, url, headers, auth.type, body, response, analysisMode, selectedModelId])
+
+  const analysisKey = useMemo(() => (
+    analysisInput ? apiAnalysisCacheKey(analysisInput) : ''
+  ), [analysisInput])
+
+  const runResponseAnalysis = async () => {
+    if (!analysisInput || !analysisKey || analysisLoading) return
+    const key = analysisKey
+    setAnalysisLoading(true)
+    setAnalysisError(null)
+    setAnalysisResult(null)
+    try {
+      const result = await analyzeApiResponse(analysisInput)
+      analysisCacheRef.current.set(key, result)
+      if (analysisCacheRef.current.size > 12) {
+        const oldest = analysisCacheRef.current.keys().next().value
+        if (oldest) analysisCacheRef.current.delete(oldest)
+      }
+      setAnalysisResult(result)
+      showToast('✅ AI 分析完成')
+    } catch (error) {
+      setAnalysisError((error as Error).message || 'AI 分析失败')
+    } finally {
+      setAnalysisLoading(false)
+    }
+  }
+
+  const openResponseAnalysis = () => {
+    setAnalysisDialogOpen(true)
+    if (!analysisKey) return
+    const cached = analysisCacheRef.current.get(analysisKey)
+    if (cached) {
+      setAnalysisResult(cached)
+      setAnalysisError(null)
+      return
+    }
+    if (!analysisLoading) void runResponseAnalysis()
+  }
+
+  // 响应变化（重新发送/切换请求）后，旧的分析结论不再适用。
+  useEffect(() => {
+    setAnalysisResult(null)
+    setAnalysisError(null)
+  }, [response])
 
   // 并发发送请求（每秒 N 路，持续 M 秒）
   const cancelSend = () => {
@@ -1371,6 +1933,10 @@ export default function ApiTest() {
     resultsToSave = concurrentResults,
   ) => {
     if (!url.trim()) return
+    if (sharedRequestMode) {
+      if (activeSharedFolder?.editStatus === 'approved') void persistSharedRequest(responseToSave, resultsToSave)
+      return
+    }
     if (currentSavedId) {
       quickSave(responseToSave, resultsToSave)
     } else {
@@ -1393,6 +1959,7 @@ export default function ApiTest() {
       }
       setSavedRequests(prev => [newReq, ...prev])
       setCurrentSavedId(newReq.id)
+      setActiveRequestId(newReq.id)
     }
   }
 
@@ -1433,6 +2000,10 @@ export default function ApiTest() {
 
   // 加载已保存请求（含上次调试结果）
   const loadRequest = (r: SavedRequest) => {
+    setActiveSharedFolderShareId(null)
+    setSharedRequestMode(false)
+    setSharedRequestId(null)
+    setDraftSource(null)
     setShowWelcome(false)
     setMethod(r.method as HttpMethod)
     setUrl(r.url)
@@ -1450,6 +2021,38 @@ export default function ApiTest() {
     setCurrentCollection(r.collection)
     setCurrentPath(normParent(r.parent))
     setCurrentSavedId(r.id)
+    setActiveRequestId(r.id)
+    setResponse(r.lastResponse ? { ...r.lastResponse } : null)
+    setConcurrentResults(r.concurrentResults || null)
+    setSelectedConcurrentResult(null)
+    if (r.concurrentConfig) {
+      setConcurrentMode(r.concurrentConfig.mode)
+      setConcurrentCount(r.concurrentConfig.count)
+      setConcurrentDuration(r.concurrentConfig.duration)
+      if (r.concurrentConfig.timeout) setRequestTimeout(r.concurrentConfig.timeout)
+    }
+  }
+
+  const loadSharedRequest = (r: SavedRequest) => {
+    setDraftSource(null)
+    setShowWelcome(false)
+    setMethod(r.method as HttpMethod)
+    setUrl(r.url)
+    setHeaders(r.headers.map(h => ({ ...h })))
+    setAuth(r.auth || defaultAuthConfig)
+    setBody(normalizePathSep(r.body))
+    const savedBody = r.bodyConfig || defaultBodyConfig
+    setBodyMode(savedBody.mode)
+    setBodyType(savedBody.rawType)
+    setBodyFields(savedBody.fields.map(field => ({ ...field })))
+    setBinaryBody(savedBody.binary)
+    setGraphqlQuery(savedBody.graphqlQuery)
+    setGraphqlVariables(savedBody.graphqlVariables)
+    setCurrentSavedId(null)
+    setActiveRequestId(null)
+    setSharedRequestMode(true)
+    setSharedRequestId(r.id)
+    setSharedRequestLabel(r.label)
     setResponse(r.lastResponse ? { ...r.lastResponse } : null)
     setConcurrentResults(r.concurrentResults || null)
     setSelectedConcurrentResult(null)
@@ -1467,6 +2070,7 @@ export default function ApiTest() {
     setSavedRequests(prev => prev.filter(r => r.id !== deleteTarget))
     if (currentSavedId === deleteTarget) {
       setCurrentSavedId(null)
+      setActiveRequestId(null)
     }
     setDeleteTarget(null)
     showToast('🗑️ 已删除')
@@ -1494,6 +2098,33 @@ export default function ApiTest() {
     setRenamingId(null)
     setRenameError('')
     showToast('✏️ 已重命名')
+  }
+
+  const duplicateRequest = (request: SavedRequest) => {
+    const duplicate: SavedRequest = {
+      ...request,
+      id: `saved_${++nextRequestId}`,
+      label: getUniqueLabel(`${request.label} 副本`, request.collection, normParent(request.parent)),
+      headers: request.headers.map(header => ({ ...header })),
+      auth: request.auth ? { ...request.auth } : undefined,
+      bodyConfig: request.bodyConfig ? {
+        ...request.bodyConfig,
+        fields: request.bodyConfig.fields.map(field => ({ ...field })),
+        binary: request.bodyConfig.binary ? { ...request.bodyConfig.binary } : null,
+      } : undefined,
+      parent: request.parent,
+      savedAt: new Date().toLocaleString('zh-CN', { hour12: false }),
+      lastResponse: request.lastResponse ? {
+        ...request.lastResponse,
+        headers: { ...request.lastResponse.headers },
+      } : undefined,
+      concurrentResults: request.concurrentResults?.map(result => ({ ...result })),
+      concurrentSummary: request.concurrentSummary ? { ...request.concurrentSummary } : undefined,
+      concurrentConfig: request.concurrentConfig ? { ...request.concurrentConfig } : undefined,
+    }
+    setSavedRequests(previous => [duplicate, ...previous])
+    loadRequest(duplicate)
+    showToast('✅ 已复制副本')
   }
 
   const rawEditorExtensions = useMemo(() => {
@@ -1681,6 +2312,10 @@ export default function ApiTest() {
   // 右栏一次只画一层，所以不再需要「拍平成一张大表再切回去」——直接取当前层的两串。
   // 渲染顺序永远是文件夹在前、请求在后；两串各自保序，拖拽排的就是各自数组里的位置。
   const browsePath = normParent(currentPath)
+  const activeSharedFolder = incomingFolderShares.find(share => share.shareId === activeSharedFolderShareId) || null
+  const activeSharedRootPath = activeSharedFolder
+    ? activeSharedFolder.rootPath || activeSharedFolder.folderName
+    : null
   const visibleFolders = useMemo(
     () => childFolders(folders, currentCollection, browsePath),
     [folders, currentCollection, browsePath],
@@ -1690,6 +2325,17 @@ export default function ApiTest() {
     [savedRequests, currentCollection, browsePath],
   )
   const breadcrumbs = useMemo(() => browseBreadcrumb(browsePath), [browsePath])
+  const sharedVisibleFolders = activeSharedFolder
+    ? childFolders(activeSharedFolder.folders, activeSharedFolder.collection, browsePath)
+    : []
+  const sharedVisibleRequests = activeSharedFolder
+    ? childRequests(activeSharedFolder.requests, activeSharedFolder.collection, browsePath)
+    : []
+  useEffect(() => {
+    if (activeSharedFolderShareId != null && !incomingFolderShares.some(share => share.shareId === activeSharedFolderShareId)) {
+      setActiveSharedFolderShareId(null)
+    }
+  }, [activeSharedFolderShareId, incomingFolderShares])
 
   /** 对半分的投放带。右栏一次只显示一层，行上就只剩前后两条边。 */
   const zoneAtDrop = (event: React.DragEvent): DropZone => {
@@ -1701,6 +2347,7 @@ export default function ApiTest() {
   const renderFolderRow = (folder: SavedFolder) => {
     const path = folderPath(folder)
     const total = childCount(folders, savedRequests, folder.collection, path)
+    const sharedCount = folderShares.filter(entry => entry.folderId === folder.id).length
     const isDragged = dragPayload?.kind === 'folder' && dragPayload.id === folder.id
     const zone = dropZoneOf(folderMenuKey(folder.id))
     // 看得见的行都在同一层，所以文件夹落到文件夹行上只可能是同层排序；
@@ -1762,6 +2409,7 @@ export default function ApiTest() {
           <span className="relative h-9 w-10 shrink-0"><svg viewBox="0 0 40 36" className="h-full w-full"><path fill="#9bd7bd" d="M2 8a3 3 0 0 1 3-3h10l4 4h16a3 3 0 0 1 3 3v19a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3Z"/><path fill="#c8eadb" d="M2 13h36v18a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3Z"/></svg></span>
           <span className="min-w-0 flex-1 truncate whitespace-nowrap text-base-content/60" title={path}>{folder.name}</span>
           <span className="shrink-0 text-base-content/20">({total})</span>
+          {sharedCount > 0 && <span className="shrink-0 text-[10px] text-primary" title={`已共享给 ${sharedCount} 人`}>↗{sharedCount}</span>}
           {/* 可下钻的提示。以前这里是收起/展开箭头，现在层级靠「你在哪一层」表达。 */}
           <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0 text-base-content/25" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 6 15 12 9 18" /></svg>
         </button>
@@ -1776,6 +2424,8 @@ export default function ApiTest() {
           <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef}>
             {/* 「新建请求 / 新建文件夹」没了：钻进来就用顶栏的 +，菜单里再放一份是同一个动作的第二条路径。 */}
             <MenuAction icon={menuIcons.edit} label="重命名" onClick={() => { closeRowMenu(); openCollectionDialog('renameFolder', folder.name, folder.collection, normParent(folder.parent)) }} />
+            <MenuAction icon={menuIcons.environment} label="环境配置" onClick={() => { closeRowMenu(); openFolderBaseUrlDialog(folder) }} />
+            <MenuAction icon={menuIcons.link} label="共享管理" onClick={() => { void openFolderShareDialog(folder) }} />
             <MenuAction icon={menuIcons.move} label="移动到" onClick={() => { closeRowMenu(); openMoveDialog('folder', folder.id) }} />
             <MenuAction icon={menuIcons.trash} label="删除" tone="danger" onClick={() => { closeRowMenu(); setDeletingFolder(folder.id) }} />
           </RowMenuPopover>
@@ -1861,6 +2511,7 @@ export default function ApiTest() {
           // 整行点了就加载请求，浮层虽然飘在外面、DOM 上仍在这行里，不挡住冒泡会连带把请求也打开。
           <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef} onClick={(event) => event.stopPropagation()}>
             <MenuAction icon={menuIcons.edit} label="重命名" onClick={() => { closeRowMenu(); openRename(r) }} />
+            <MenuAction icon={menuIcons.copy} label="复制副本" onClick={() => { closeRowMenu(); duplicateRequest(r) }} />
             <MenuAction icon={menuIcons.move} label="移动到" onClick={() => { closeRowMenu(); openMoveDialog('request', r.id) }} />
             <MenuAction icon={menuIcons.trash} label="删除" tone="danger" onClick={() => { closeRowMenu(); setDeleteTarget(r.id) }} />
           </RowMenuPopover>
@@ -1959,7 +2610,7 @@ export default function ApiTest() {
                       <button
                         type="button"
                         className="flex min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1 py-1 text-left"
-                        onClick={() => { setCurrentCollection(c.name); setCurrentPath(null) }}
+                        onClick={() => { setActiveSharedFolderShareId(null); setCurrentCollection(c.name); setCurrentPath(null) }}
                         title={`打开“${c.name}”`}
                       >
                         <span className="relative h-9 w-10 shrink-0"><svg viewBox="0 0 40 36" className="h-full w-full"><path fill="#9bd7bd" d="M2 8a3 3 0 0 1 3-3h10l4 4h16a3 3 0 0 1 3 3v19a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3Z"/><path fill="#c8eadb" d="M2 13h36v18a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3Z"/></svg></span>
@@ -1982,6 +2633,34 @@ export default function ApiTest() {
                     </div>
                   )
                 })}
+                {!isAdminUser && (incomingFolderShares.length > 0 || folderShareError) && (
+                  <div className="mt-3 border-t border-base-200 pt-2">
+                    <div className="px-2 pb-1 text-[10px] font-semibold tracking-wide text-base-content/35">共享给我的</div>
+                    {folderShareError && <p className="px-2 pb-1 text-[10px] text-error">{folderShareError}</p>}
+                    {incomingFolderShares.map(share => (
+                      <button
+                        key={share.shareId}
+                        type="button"
+                        onClick={() => {
+                          setActiveSharedFolderShareId(share.shareId)
+                          setCurrentPath(share.rootPath || share.folderName)
+                          setShowWelcome(false)
+                        }}
+                        className={`mb-1 flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-2 text-left transition-colors ${
+                          activeSharedFolderShareId === share.shareId ? 'bg-primary/10 text-primary' : 'text-base-content/65 hover:bg-base-200/70'
+                        }`}
+                        title={`来自 ${share.ownerName} · ${share.folderName}`}
+                      >
+                        <span className="shrink-0 text-base-content/35">↗</span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-xs font-medium">{share.folderName}</span>
+                          <span className="block truncate text-[10px] text-base-content/40">{share.ownerName}</span>
+                        </span>
+                        <span className="shrink-0 text-[10px] text-base-content/30">{share.requests.length}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
               <div className="border-t border-base-200 px-3 py-2">
                 <button type="button" className="btn btn-ghost btn-block btn-sm" onClick={() => openCollectionDialog('create')} title="新建集合">+ 新建集合</button>
@@ -1999,6 +2678,183 @@ export default function ApiTest() {
 
             {/* ===== 右栏：当前这一层 ===== */}
             <div className="flex min-w-0 flex-1 flex-col">
+              {activeSharedFolder ? (
+                <>
+                  <div className="flex h-14 items-center gap-2 border-b border-base-200 px-3">
+                    {browsePath !== activeSharedRootPath && (
+                      <button
+                        type="button"
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-base-content/45 transition hover:bg-base-200 hover:text-base-content"
+                        onClick={() => setCurrentPath(parentPathOf(browsePath))}
+                        title="返回上一级"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6" /></svg>
+                      </button>
+                    )}
+                    <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+                      {!browsePath || browsePath === activeSharedRootPath ? activeSharedFolder.folderName : leafNameOf(browsePath)}
+                    </span>
+                    <span className="shrink-0 rounded-full bg-base-200 px-2 py-1 text-[10px] text-base-content/55">
+                      来自 {activeSharedFolder.ownerName} · {activeSharedFolder.editStatus === 'approved' ? '可编辑' : '只读'}
+                    </span>
+                    {activeSharedFolder.editStatus !== 'approved' && (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-xs"
+                        disabled={activeSharedFolder.editStatus === 'pending'}
+                        onClick={() => void requestSharedFolderEdit(activeSharedFolder)}
+                      >
+                        {activeSharedFolder.editStatus === 'pending'
+                          ? '编辑申请中'
+                          : activeSharedFolder.editStatus === 'rejected' ? '重新申请编辑' : '申请编辑'}
+                      </button>
+                    )}
+                    {activeSharedFolder.editStatus === 'approved' && <>
+                      <button
+                        type="button"
+                        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition hover:bg-base-300/70 ${
+                          openMenuId === newEntryMenuKey ? 'bg-base-300/70 text-base-content' : 'text-base-content/40'
+                        }`}
+                        aria-haspopup="menu"
+                        aria-expanded={openMenuId === newEntryMenuKey}
+                        aria-label="新建"
+                        title="新建"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          rowMenu.toggle(newEntryMenuKey, event.currentTarget)
+                        }}
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 5v14M5 12h14" /></svg>
+                      </button>
+                      {openMenuId === newEntryMenuKey && menuAnchor ? (
+                        <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef}>
+                          <MenuAction icon={menuIcons.folderPlus} label="新建请求" onClick={() => { closeRowMenu(); startNewSharedRequest() }} />
+                          <MenuAction icon={menuIcons.folderPlus} label="新建文件夹" onClick={() => { closeRowMenu(); void createSharedSubfolder() }} />
+                        </RowMenuPopover>
+                      ) : null}
+                    </>}
+                  </div>
+                  {browsePath && (
+                    <div className="flex h-10 items-center gap-1 overflow-hidden border-b border-base-200 px-4 text-xs text-base-content/45">
+                      <button
+                        type="button"
+                        className="shrink-0 hover:text-primary"
+                        onClick={() => setCurrentPath(activeSharedRootPath)}
+                      >
+                        {activeSharedFolder.folderName}
+                      </button>
+                      {(browsePath && activeSharedRootPath && browsePath.startsWith(`${activeSharedRootPath}/`)
+                        ? browsePath.slice(activeSharedRootPath.length).split('/').filter(Boolean)
+                        : []).map((part, index, parts) => {
+                        const path = `${activeSharedRootPath}/${parts.slice(0, index + 1).join('/')}`
+                        return <span key={path} className="flex min-w-0 items-center gap-1">
+                          <span className="shrink-0">/</span>
+                          <button
+                            type="button"
+                            className={index === parts.length - 1 ? 'truncate font-medium text-base-content/70' : 'shrink-0 hover:text-primary'}
+                            onClick={() => setCurrentPath(path)}
+                          >{part}</button>
+                        </span>
+                      })}
+                    </div>
+                  )}
+                  <div className="flex-1 overflow-y-auto p-2">
+                    {!sharedVisibleFolders.length && !sharedVisibleRequests.length ? (
+                      <div className="rounded-lg border border-dashed border-base-200 bg-base-200/40 p-3 text-[11px] text-base-content/40">该文件夹下暂无内容</div>
+                    ) : (
+                      <>
+                        {sharedVisibleFolders.map(folder => {
+                          const menuKey = sharedFolderMenuKey(activeSharedFolder.shareId, folder.id)
+                          const path = folderPath(folder)
+                          const total = childCount(activeSharedFolder.folders, activeSharedFolder.requests, folder.collection, path)
+                          return (
+                            <div
+                              key={menuKey}
+                              className={`group flex min-w-0 flex-nowrap items-center gap-1 whitespace-nowrap rounded-lg py-1 pr-2 text-sm tracking-wider text-base-content/40 transition-colors hover:bg-base-200/70 ${
+                                openMenuId === menuKey ? 'bg-base-200/70' : ''
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                className="flex min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1.5 py-1.5 text-left"
+                                onClick={() => setCurrentPath(path)}
+                                title={`进入“${folder.name}”`}
+                              >
+                                <span className="relative h-9 w-10 shrink-0"><svg viewBox="0 0 40 36" className="h-full w-full"><path fill="#9bd7bd" d="M2 8a3 3 0 0 1 3-3h10l4 4h16a3 3 0 0 1 3 3v19a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3Z"/><path fill="#c8eadb" d="M2 13h36v18a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3Z"/></svg></span>
+                                <span className="min-w-0 flex-1 truncate whitespace-nowrap text-base-content/60" title={path}>{folder.name}</span>
+                                <span className="shrink-0 text-base-content/20">({total})</span>
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0 text-base-content/25" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="9 6 15 12 9 18" /></svg>
+                              </button>
+                              {activeSharedFolder.editStatus === 'approved' && <>
+                                <div className="mr-1">
+                                  <RowMenuTrigger
+                                    open={openMenuId === menuKey}
+                                    onClick={(event) => { event.stopPropagation(); rowMenu.toggle(menuKey, event.currentTarget) }}
+                                    label={`${folder.name}操作`}
+                                  />
+                                </div>
+                                {openMenuId === menuKey && menuAnchor ? (
+                                  <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef} onClick={(event) => event.stopPropagation()}>
+                                    <MenuAction icon={menuIcons.environment} label="环境配置" onClick={() => { closeRowMenu(); openFolderBaseUrlDialog(folder, activeSharedFolder.shareId) }} />
+                                    <MenuAction icon={menuIcons.edit} label="重命名" onClick={() => { closeRowMenu(); void renameSharedSubfolder(folder) }} />
+                                    <MenuAction icon={menuIcons.trash} label="删除" tone="danger" onClick={() => { closeRowMenu(); void deleteSharedSubfolder(folder) }} />
+                                  </RowMenuPopover>
+                                ) : null}
+                              </>}
+                            </div>
+                          )
+                        })}
+                        {sharedVisibleRequests.map(request => {
+                          const menuKey = sharedRequestMenuKey(activeSharedFolder.shareId, request.id)
+                          return (
+                            <div
+                              key={menuKey}
+                              className={`group flex items-center gap-2 rounded-lg py-2 pr-2.5 text-left text-sm transition-colors hover:bg-base-200 ${
+                                openMenuId === menuKey ? 'bg-base-200' : ''
+                              }`}
+                              onClick={() => loadSharedRequest(request)}
+                            >
+                              <span className={`w-10 shrink-0 font-mono text-[10px] font-bold ${methodColors[request.method as HttpMethod]}`}>
+                                {request.method}
+                              </span>
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate font-medium text-base-content">{request.label}</div>
+                                <div className="truncate text-[10px] text-base-content/30">{request.url}</div>
+                              </div>
+                              {request.concurrentSummary ? (
+                                <div className="mr-0.5 flex shrink-0 items-center gap-1 text-[10px]">
+                                  <span className="text-green-600">{request.concurrentSummary.success}✓</span>
+                                  {request.concurrentSummary.failed > 0 && <span className="text-red-500">{request.concurrentSummary.failed}✗</span>}
+                                </div>
+                              ) : request.lastResponse ? (
+                                <div className={`mr-0.5 shrink-0 text-[10px] font-bold ${
+                                  request.lastResponse.status >= 400 ? 'text-red-500' : request.lastResponse.status >= 300 ? 'text-amber-500' : 'text-green-600'
+                                }`}>
+                                  {request.lastResponse.status}
+                                </div>
+                              ) : null}
+                              {activeSharedFolder.editStatus === 'approved' && <>
+                                <RowMenuTrigger
+                                  open={openMenuId === menuKey}
+                                  onClick={(event) => { event.stopPropagation(); rowMenu.toggle(menuKey, event.currentTarget) }}
+                                  label={`${request.label}操作`}
+                                />
+                                {openMenuId === menuKey && menuAnchor ? (
+                                  <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef} onClick={(event) => event.stopPropagation()}>
+                                    <MenuAction icon={menuIcons.edit} label="重命名" onClick={() => { closeRowMenu(); void renameSharedRequest(request) }} />
+                                    <MenuAction icon={menuIcons.trash} label="删除" tone="danger" onClick={() => { closeRowMenu(); void deleteSharedRequest(request) }} />
+                                  </RowMenuPopover>
+                                ) : null}
+                              </>}
+                            </div>
+                          )
+                        })}
+                      </>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
               <div className="flex h-14 items-center gap-1 border-b border-base-200 px-3">
                 {browsePath && (
                   <button
@@ -2064,6 +2920,8 @@ export default function ApiTest() {
                   </>
                 )}
               </div>
+                </>
+              )}
             </div>
           </aside>
           {/* 侧边栏拖拽手柄 */}
@@ -2154,6 +3012,45 @@ export default function ApiTest() {
         ) : (
         <>
         {/* ===== 工具栏 ===== */}
+        {sharedRequestMode && (
+          <div className="border-b border-primary/15 bg-primary/5 px-4 py-2 text-xs text-primary/80">
+            {activeSharedFolder?.editStatus === 'approved'
+              ? '你已获得编辑权限；保存将更新共享请求，发送后的响应也会同步保存。'
+              : '正在调试共享请求；修改仅作用于当前会话，不会改动共享内容。可使用“复制到我的请求”另存。'}
+          </div>
+        )}
+        {draftSource ? (() => {
+          const relative = Boolean(url.trim()) && !/^https?:\/\//i.test(url.trim())
+          const needsAuth = (auth.type === 'bearer' && !auth.token.trim())
+            || (auth.type === 'basic' && (!auth.username.trim() || !auth.password.trim()))
+            || (auth.type === 'apiKey' && !auth.apiValue.trim())
+          const warnings = [
+            relative && !currentFolderBaseUrl ? '相对路径需配置 Base URL' : '',
+            needsAuth ? '请补全认证信息' : '',
+            ...draftSource.notices,
+          ].filter(Boolean)
+          return (
+            <div className="flex flex-wrap items-center gap-2 border-b border-primary/15 bg-primary/5 px-4 py-2 text-xs">
+              <span className="font-medium text-primary">来自知识库问答</span>
+              <span className={`rounded px-1.5 py-0.5 text-[10px] ${draftSource.confidence === 'full' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+                {draftSource.confidence === 'full' ? '完整请求' : '仅方法/路径'}
+              </span>
+              <span className="rounded bg-base-100 px-1.5 py-0.5 text-[10px] text-base-content/50">{currentSavedId ? '已保存' : '未保存草稿'}</span>
+              {draftSource.origin.question ? (
+                <span className="min-w-0 max-w-md truncate text-base-content/50" title={draftSource.origin.question}>「{draftSource.origin.question}」</span>
+              ) : null}
+              {draftSource.origin.citationIds.length ? <span className="text-base-content/40">引用 {draftSource.origin.citationIds.length} 条</span> : null}
+              {warnings.length ? <span className="text-amber-600" title={warnings.join('；')}>{warnings[0]}</span> : null}
+              <button
+                type="button"
+                className="ml-auto rounded px-2 py-1 text-base-content/45 transition hover:bg-base-200 hover:text-base-content"
+                onClick={() => setDraftSource(null)}
+              >
+                关闭
+              </button>
+            </div>
+          )
+        })() : null}
         <div className="flex min-w-0 flex-wrap items-center gap-2 border-b border-base-200 bg-base-100 px-4 py-3">
           <select
             className={`select select-sm w-48 shrink-0 border font-bold text-xs ${methodSelectBg[method]}`}
@@ -2168,7 +3065,8 @@ export default function ApiTest() {
             className="input input-bordered input-sm min-w-0 flex-1 text-xs"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://api.example.com/v1/..."
+            placeholder={currentFolderBaseUrl ? '接口路径，如 /v1/chat/completions' : 'https://api.example.com/v1/...'}
+            title={currentFolderBaseUrl ? `Base URL: ${currentFolderBaseUrl}` : undefined}
           />
 
 
@@ -2176,6 +3074,10 @@ export default function ApiTest() {
           <button
             className="btn btn-ghost btn-sm gap-1.5 text-base-content/60"
             onClick={() => {
+              if (sharedRequestMode && activeSharedFolder?.editStatus === 'approved') {
+                void persistSharedRequest()
+                return
+              }
               if (currentSavedId) {
                 quickSave()
                 return
@@ -2185,12 +3087,14 @@ export default function ApiTest() {
                 : null
               setSaveLabel(saved?.label || url.split('/').pop()?.split('?')[0]?.split('.')[0] || '未命名')
               setSaveCollection(saved?.collection || currentCollection)
-              setSaveParent(saved ? normParent(saved.parent) : currentPath)
+              setSaveParent(saved ? normParent(saved.parent) : sharedRequestMode ? null : currentPath)
               setShowSaveModal(true)
             }}
           >
             <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /></svg>
-            保存
+            {sharedRequestMode && activeSharedFolder?.editStatus === 'approved'
+              ? '保存共享请求'
+              : sharedRequestMode ? '复制到我的请求' : '保存'}
           </button>
 
           {/* 并发切换 */}
@@ -2667,6 +3571,17 @@ export default function ApiTest() {
               <button className={`btn btn-ghost btn-xs ${activeResponseTab === 'concurrent' ? 'btn-active' : ''} ${concurrentMode ? '' : 'opacity-30'}`} onClick={() => setActiveResponseTab('concurrent')}>
                 📊 并发
               </button>
+              {response ? (
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-xs text-primary"
+                  onClick={openResponseAnalysis}
+                  disabled={analysisLoading}
+                  title="AI 响应分析：解释/排查/生成测试"
+                >
+                  {analysisLoading ? '分析中…' : '🤖 AI 分析'}
+                </button>
+              ) : null}
             </div>
           </div>
           <div className="flex-1 overflow-y-auto p-4">
@@ -2763,6 +3678,101 @@ export default function ApiTest() {
         )}
       </div>
 
+      {/* ========== AI 响应分析 ========== */}
+      {analysisDialogOpen && (
+        <Dialog width="2xl" onClose={() => setAnalysisDialogOpen(false)}>
+          <div className="flex min-h-0 flex-1 flex-col gap-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-medium text-base-content/50">分析模式：</span>
+              {[
+                { id: 'explain', label: '解释响应' },
+                { id: 'troubleshoot', label: '排查问题' },
+                { id: 'tests', label: '生成测试' },
+              ].map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    const nextMode = item.id as ApiResponseAnalysisMode
+                    setAnalysisMode(nextMode)
+                    setAnalysisError(null)
+                    if (!analysisInput) {
+                      setAnalysisResult(null)
+                      return
+                    }
+                    const cached = analysisCacheRef.current.get(apiAnalysisCacheKey({ ...analysisInput, mode: nextMode }))
+                    setAnalysisResult(cached || null)
+                  }}
+                  className={`btn btn-xs btn-ghost ${analysisMode === item.id ? 'btn-active text-primary' : 'text-base-content/60 hover:text-base-content'}`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center gap-3 text-xs">
+              <span className="w-16 shrink-0 text-base-content/50">模型：</span>
+              <select
+                value={selectedModelId}
+                onChange={(e) => setSelectedModelId(e.target.value)}
+                className="select select-sm border text-xs shrink-0 w-48"
+              >
+                {modelsLoaded
+                  ? models.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.id}
+                      </option>
+                    ))
+                  : <option>加载模型…</option>}
+              </select>
+            </div>
+            {analysisError && (
+              <div className="p-2 rounded border border-error/20 bg-error/5 text-error text-xs">
+                {analysisError}
+                <button
+                  type="button"
+                  onClick={() => void runResponseAnalysis()}
+                  className="ml-2 btn btn-xs btn-error"
+                >
+                  重试
+                </button>
+              </div>
+            )}
+            {analysisLoading ? (
+              <div className="h-24 flex items-center justify-center text-xs text-base-content/40">正在请求模型分析，请稍候…</div>
+            ) : analysisResult ? (
+              <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain border-t border-base-200 pr-1 pt-3 space-y-4">
+                <div className="flex items-center gap-2 text-[10px] text-base-content/40">
+                  <span>{analysisResult.model}</span>
+                  {analysisResult.usage?.total_tokens != null && (
+                    <span>· {analysisResult.usage.total_tokens} tokens</span>
+                  )}
+                </div>
+                {renderAssistantBlocks(analysisResult.content)}
+              </div>
+            ) : (
+              <div className="h-24 flex items-center justify-center text-xs text-base-content/30">完成一次发送后，点击响应区的「AI 分析」即可开始</div>
+            )}
+          </div>
+          <div className="mt-6 flex shrink-0 justify-end gap-2">
+            <button type="button" onClick={() => setAnalysisDialogOpen(false)} className="btn btn-ghost">
+              关闭
+            </button>
+            {!analysisLoading && analysisInput && (
+              <button
+                type="button"
+                onClick={() => {
+                  setAnalysisResult(null)
+                  setAnalysisError(null)
+                  void runResponseAnalysis()
+                }}
+                className="btn btn-primary"
+              >
+                {analysisResult ? '重新分析' : '开始分析'}
+              </button>
+            )}
+          </div>
+        </Dialog>
+      )}
       {/* ========== 单条并发响应详情 ========== */}
       {selectedConcurrentResult && (
         <Dialog width="2xl" onClose={() => setSelectedConcurrentResult(null)}>
@@ -2795,6 +3805,80 @@ export default function ApiTest() {
         </Dialog>
       )}
 
+      {shareDialogFolderId && (() => {
+        const folder = folders.find(item => item.id === shareDialogFolderId)
+        if (!folder) return null
+        const entries = folderShares.filter(entry => entry.folderId === folder.id)
+        const alreadySharedIds = new Set(entries.map(entry => entry.granteeUserId))
+        const pickedCount = [...sharePicked].filter(id => !alreadySharedIds.has(id)).length
+        const closeShareDialog = () => {
+          setShareDialogFolderId(null)
+          setShareError(null)
+          setSharePicked(new Set())
+        }
+        return <Dialog onClose={closeShareDialog}>
+          <DialogHeader
+            title="文件夹共享管理"
+            icon={menuIcons.link}
+            subtitle={`“${folder.name}”及其全部子文件夹、请求将共享为只读；接收方可申请编辑权限`}
+            onClose={closeShareDialog}
+          />
+          <div className="mt-3 rounded-lg border border-base-200 p-2">
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-sm">指定用户可见</span>
+              <span className="text-xs text-base-content/45">已选择 {pickedCount} 人</span>
+            </div>
+            <div className="max-h-56 space-y-0.5 overflow-y-auto">
+              {shareCandidates.map(user => {
+                const shared = alreadySharedIds.has(user.id)
+                return <label key={user.id} className={`flex items-center gap-2 rounded px-1.5 py-1 text-sm ${shared ? 'opacity-45' : 'cursor-pointer hover:bg-base-200/70'}`}>
+                  <input
+                    type="checkbox"
+                    className="checkbox checkbox-sm"
+                    checked={shared || sharePicked.has(user.id)}
+                    disabled={shared || shareBusy}
+                    onChange={() => setSharePicked(current => {
+                      const next = new Set(current)
+                      if (next.has(user.id)) next.delete(user.id)
+                      else next.add(user.id)
+                      return next
+                    })}
+                  />
+                  <span className="truncate">{user.nickname}</span>
+                  {user.nickname !== user.username && <span className="truncate text-xs text-base-content/40">@{user.username}</span>}
+                  {shared && <span className="ml-auto shrink-0 rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">已共享</span>}
+                </label>
+              })}
+              {!shareCandidates.length && <p className="px-1.5 py-2 text-xs text-base-content/35">暂无可共享的用户</p>}
+            </div>
+            {entries.length > 0 && <div className="mt-2 border-t border-base-200 pt-2">
+              <p className="mb-1 text-xs text-base-content/45">已共享用户与编辑申请</p>
+              <div className="max-h-28 space-y-0.5 overflow-y-auto">
+                {entries.map(entry => <div key={entry.shareId} className="flex items-center gap-2 px-1.5 py-0.5 text-sm">
+                  <span className="min-w-0 flex-1 truncate">{entry.granteeName}</span>
+                  {entry.editStatus === 'pending' ? <>
+                    <span className="shrink-0 text-[10px] text-warning">申请编辑</span>
+                    <button type="button" onClick={() => void updateFolderEditAccess(entry.shareId, 'approved')} disabled={shareBusy} className="btn btn-ghost btn-xs text-success">批准</button>
+                    <button type="button" onClick={() => void updateFolderEditAccess(entry.shareId, 'rejected')} disabled={shareBusy} className="btn btn-ghost btn-xs">拒绝</button>
+                  </> : entry.editStatus === 'approved' ? <>
+                    <span className="shrink-0 text-[10px] text-success">可编辑</span>
+                    <button type="button" onClick={() => void updateFolderEditAccess(entry.shareId, 'none')} disabled={shareBusy} className="btn btn-ghost btn-xs text-warning">撤销编辑</button>
+                  </> : entry.editStatus === 'rejected' ? <span className="shrink-0 text-[10px] text-base-content/40">已拒绝</span> : null}
+                  <button type="button" onClick={() => void revokeFolderShare(entry)} disabled={shareBusy} className="btn btn-ghost btn-xs text-error">取消共享</button>
+                </div>)}
+              </div>
+            </div>}
+          </div>
+          <DialogError>{shareError}</DialogError>
+          <DialogActions>
+            <button onClick={closeShareDialog} className="btn btn-ghost">关闭</button>
+            <button onClick={() => void saveFolderShares()} disabled={shareBusy || !pickedCount} className="btn btn-primary">
+              {shareBusy ? '保存中…' : `共享给所选${pickedCount ? `（${pickedCount} 人）` : ''}`}
+            </button>
+          </DialogActions>
+        </Dialog>
+      })()}
+
       {/* ========== 删除请求确认 ========== */}
       {deleteTarget && (() => {
         const target = savedRequests.find(item => item.id === deleteTarget)
@@ -2817,9 +3901,9 @@ export default function ApiTest() {
       {showSaveModal && (
         <Dialog onClose={() => setShowSaveModal(false)}>
           <DialogHeader
-            title="保存配置"
+            title={sharedRequestMode ? '复制到我的请求' : '保存配置'}
             icon={menuIcons.save}
-            subtitle="设置请求名称并选择保存合集"
+            subtitle={sharedRequestMode ? '另存到自己的集合，不会改动共享内容' : '设置请求名称并选择保存合集'}
             onClose={() => setShowSaveModal(false)}
           />
           <DialogField label="请求名称" required>
@@ -2899,6 +3983,47 @@ export default function ApiTest() {
           <DialogActions>
             <button className="btn btn-ghost" onClick={closeRename}>取消</button>
             <button className="btn btn-primary" disabled={!renameLabel.trim() || renameLabel.trim() === target?.label} onClick={confirmRename}>保存</button>
+          </DialogActions>
+        </Dialog>
+      })()}
+
+      {baseUrlDialog && (() => {
+        const sharedFolder = baseUrlDialog.shareId == null
+          ? null
+          : incomingFolderShares.find(share => share.shareId === baseUrlDialog.shareId) || null
+        const folder = baseUrlDialog.shareId == null
+          ? folders.find(item => item.id === baseUrlDialog.folderId)
+          : sharedFolder?.folders.find(item => item.id === baseUrlDialog.folderId)
+        const closeDialog = () => {
+          setBaseUrlDialog(null)
+          setBaseUrlError('')
+        }
+        if (!folder) return null
+        return <Dialog onClose={closeDialog}>
+          <DialogHeader
+            title="环境配置（Base URL）"
+            icon={menuIcons.environment}
+            subtitle={`“${folder.name}”及其下级请求将使用此地址；子文件夹可单独设置并覆盖`}
+            onClose={closeDialog}
+          />
+          <DialogField label="Base URL">
+            <input
+              type="url"
+              className={`input input-bordered mt-1.5 w-full ${baseUrlError ? 'input-error' : ''}`}
+              placeholder="https://api.example.com"
+              value={baseUrlDraft}
+              onChange={(event) => { setBaseUrlDraft(event.target.value); setBaseUrlError('') }}
+              onKeyDown={(event) => { if (event.key === 'Enter') void saveFolderBaseUrl(); if (event.key === 'Escape') closeDialog() }}
+              autoFocus
+            />
+          </DialogField>
+          <p className="mt-2 text-xs leading-5 text-base-content/45">
+            可留空以清除配置。设置后，请求输入框填写接口路径即可，例如 <code>/v1/users</code>；完整 URL 请求仍按原地址发送。
+          </p>
+          <DialogError>{baseUrlError}</DialogError>
+          <DialogActions>
+            <button className="btn btn-ghost" onClick={closeDialog}>取消</button>
+            <button className="btn btn-primary" onClick={() => void saveFolderBaseUrl()}>保存</button>
           </DialogActions>
         </Dialog>
       })()}

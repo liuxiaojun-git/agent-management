@@ -4,6 +4,8 @@ import { firstAllowedPath } from '../utils/permissions'
 // base URL 已收敛到 utils/apiBase.ts（原本此处有一份与另外 3 个文件逐字重复的定义）
 import { V1_BASE } from '../utils/apiBase'
 
+import loginBgImage from '../assets/智域：AI工作搭档登录页 2.png'
+
 export default function LoginPage() {
   const navigate = useNavigate()
 
@@ -95,9 +97,10 @@ export default function LoginPage() {
         </div>
       )}
 
-      <div className="flex w-full items-center justify-center p-4 md:p-8 lg:w-2/5 xl:w-1/3">
+      {/* 左侧：登录表单（保持原来的左右宽度比例） */}
+      <div className="flex w-full items-center justify-center p-4 md:p-8 lg:w-2/5 xl:w-1/3 min-w-0">
         <div className="w-full max-w-xl">
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 mb-8">
             <img
               src="/src/assets/zhiyu-favicon-package/favicon.svg"
               className="h-12 w-12 shrink-0"
@@ -188,22 +191,14 @@ export default function LoginPage() {
         </div>
       </div>
 
-      <div className="hidden h-screen flex-1 items-center justify-center overflow-hidden bg-base-200 lg:flex">
-        <div className="p-12 text-center">
-          <div className="mb-6 text-6xl">🤖</div>
-
-          <h2 className="text-2xl font-semibold text-base-content">
-            智域
-          </h2>
-
-          <p className="mt-2 text-base font-semibold text-base-content/60">
-            Personal AI Workspace
-          </p>
-
-          <p className="mt-2 text-base text-base-content/40">
-            让 AI 成为你的工作搭档
-          </p>
-        </div>
+      {/* 右侧：底图（保持原来 flex-1 剩余宽度） */}
+      <div className="hidden h-screen flex-1 relative overflow-hidden lg:flex">
+        <img
+          src={loginBgImage}
+          className="w-full h-full object-cover"
+          alt="登录页底图"
+        />
+        <div className="absolute inset-0 bg-base-100/30" />
       </div>
     </div>
   )

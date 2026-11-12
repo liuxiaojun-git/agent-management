@@ -4,7 +4,7 @@
 
 ### 1. 安装依赖包
 - **xlsx** (SheetJS): 用于解析 Excel 文件 (.xlsx, .xls, .csv)
-- **mammoth**: 用于解析 Word 文档 (.docx, .doc)
+- **mammoth**: 用于解析 `.docx` Word 文档
 
 ```bash
 npm install xlsx mammoth
@@ -30,7 +30,9 @@ export function createWordPreviewHtml(doc: WordDocument): string
 **关键特性:**
 - ✅ 自动从 Data URL 提取二进制数据
 - ✅ 支持所有 Excel 工作表
-- ✅ 保留 Word 文档结构和样式
+- ✅ `.docx` 保留可解析的 Word 文档结构和样式
+- ✅ `.doc` 由知识库后端的 `word-extractor` 提取正文并按纯文本预览，不保留旧格式排版
+- ✅ `.doc` 可在线编辑正文，保存时原子转换为 `.docx` 并同步重命名知识库条目
 - ✅ 智能处理空值和数据类型
 
 ### 3. 创建 React 渲染组件 (`src/components/DocumentRenderer.tsx`)

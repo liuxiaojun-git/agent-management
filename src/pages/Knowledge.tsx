@@ -1,7 +1,9 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { apiRequest, apiRequestWithProgress, askKnowledge, getDocumentConversations, getKnowledgeConversations, replaceContentAsset, saveDocumentConversations, saveKnowledgeConversations, type KnowledgeAskScope } from '../utils/api'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { apiRequest, apiRequestWithProgress, askKnowledge, getDocumentConversations, getKnowledgeConversations, getLegacyWordText, replaceContentAsset, saveDocumentConversations, saveKnowledgeConversations, getSharedKnowledgeWorkspace, listKnowledgeShares, revokeKnowledgeShare, listShareCandidates, createUserKnowledgeShares, saveSharedLibraryOrder, type KnowledgeAskScope, type SharedKnowledgeLibrary, type KnowledgeShareEntry, type ShareCandidate, type ShareOrgNode } from '../utils/api'
+import { stashApiDraft, toApiDraft, extractApiDrafts, toCurl, type ApiDraftCandidate, type ApiDraftOrigin } from '../utils/apiDraft'
 import {
-  bytesToDataUrl, getKnowledgeWorkspace, invalidateContentAsset, supportsContentAsset, useContentSrc, useThumbnailSrc,
+  bytesToDataUrl, getContentSrc, getKnowledgeWorkspace, invalidateContentAsset, supportsContentAsset, useContentSrc, useThumbnailSrc,
   THUMBNAIL_LIMIT, type AssetState,
 } from '../utils/contentAsset'
 import DocumentRenderer from '../components/DocumentRenderer'
@@ -9,16 +11,27 @@ import DocumentEditor, { type EditDraft, type EditableKind } from '../components
 // 弹窗、⋯ 浮层菜单、图标与 AI 问答页共用一套，定义在 components/OperationUI.tsx 与 operationMenu.tsx。
 import { Dialog, DialogActions, DialogError, DialogField, DialogHeader, Icon, MenuAction, MenuPanel, RowMenuPopover, RowMenuTrigger } from '../components/OperationUI'
 import { menuIcons, useRowMenu } from '../components/operationMenu'
-import { buildExcelBytes, parseExcelFile, parseWordDocument, DOCX_MIME_TYPE } from '../utils/documentRenderer'
-import { htmlToMarkdown } from '../utils/htmlToMarkdown'
+import { buildExcelBytes, parseExcelFile, DOCX_MIME_TYPE, XLSX_MIME_TYPE } from '../utils/documentRenderer'
 import { markdownToDocxBytes } from '../utils/markdownToDocx'
+import { readDocxForEditing, writeDocxEdits } from '../utils/docxEditor'
 import { renderAssistantBlocks } from '../utils/assistantMarkdown'
+import { canAccess } from '../utils/permissions'
 
+// 徽标不在这里：共享状态是独立 state（outgoingByLibrary），渲染时实时查 ——
+// 盖章进库对象会被任何一次 setLibraries(快照) 整份覆盖（切换选中库、标签页回来静默刷新），
+// 表现就是"一点别的库，已共享徽标全没了，刷新又回来"。派生渲染没有这个状态可丢。
 type Library = { id: number; name: string; icon: string; description: string; count: number; type?: 'personal' | 'shared' | 'subscribed' }
+// 收到的共享库（一期全员只读）：来自 GET /knowledge/shared/workspace，只读展示。
+// 与私有 Library 分开建模 —— 它绝不能进 PUT /workspace 的 libraries（后端会拒绝混入他人库 id）。
+type SharedLibrary = SharedKnowledgeLibrary
+// 侧栏「共享知识库」分区的 key。拖拽时用它区分「从哪个分区拖出来的」。
+// ⚠️ 它和 Library['type'] 的取值空间**有重叠**（枚举里也有 'shared'），所以任何判定都必须
+// 同时查 sharedLibraries 的成员资格，不能只比这个字符串 —— 见 moveSharedLibrary。
+const SHARED_SECTION = 'shared'
 // url 是「网页链接」条目的外链地址：这类条目没有文件字节，点击直接在浏览器里打开该地址，
 // 不进入文档预览，也不参与针对文档的问答作用域。
 type ContentItem = { id: string; name: string; type: 'folder' | 'doc' | 'pdf' | 'image'; count?: number; createdAt: string; updatedAt: string; contentUpdatedAt?: string; parent?: string; src?: string; mimeType?: string; size?: number; hasAsset?: boolean; url?: string }
-type Citation = { id: number; title: string; path?: string; updated?: string }
+type Citation = { id: number; title: string; path?: string; updated?: string; url?: string; source?: 'internet' }
 type ChatMessage = { role: 'user' | 'assistant'; text: string; citations?: Citation[]; createdAt?: string }
 type Conversation = { id: string; title: string; messages: ChatMessage[]; createdAt: string; updatedAt: string }
 type KnowledgeGroup = { key: string; name: string; system: boolean }
@@ -124,6 +137,16 @@ const maxPdfSize = 100 * 1024 * 1024
 const maxOfficeSize = 100 * 1024 * 1024
 const textFilePattern = /\.(txt|md|markdown|csv|json|xml|html?)$/i
 
+const safeCitationUrl = (value?: string) => {
+  if (!value) return undefined
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : undefined
+  } catch {
+    return undefined
+  }
+}
+
 const createContentId = () => (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
   ? crypto.randomUUID()
   : `content-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
@@ -132,6 +155,39 @@ const createContentId = () => (typeof crypto !== 'undefined' && 'randomUUID' in 
 // 内容 id 是客户端 UUID，用前缀把这三种键分开，不会撞上。
 const libraryMenuKey = (libraryId: number) => `library:${libraryId}`
 const sectionMenuKey = (sectionKey: string) => `section:${sectionKey}`
+
+// 「指定用户」层级下拉里代表"不属于任何层级"的哨兵节点 id。真实节点 id 是自增正整数，
+// 取 -1 与之不相交（同 sql/030 的 parent_id = 0 哨兵思路）。共享管理弹窗与新建知识库
+// 弹窗共用这一套层级选择，口径必须只有一份 —— 两处对不齐就会出现"这里看得到、那里看不到"。
+const UNASSIGNED_NODE = -1
+
+// 层级下拉的选项：按树的先序铺平，用全角空格缩进表示深度（原生 option 排不了版），
+// 「未分配」列在最末 —— 它下面挂着全部管理员账号（admin_user 没有归属列）。
+const buildLevelOptions = (nodes: ShareOrgNode[], includeUnassigned: boolean) => {
+  const options: Array<{ value: number; label: string }> = []
+  const walk = (parentId: number, depth: number) => {
+    for (const node of nodes.filter((item) => item.parentId === parentId)) {
+      options.push({ value: node.id, label: `${'　'.repeat(depth)}${node.name}` })
+      walk(node.id, depth + 1)
+    }
+  }
+  walk(0, 0)
+  if (includeUnassigned) options.push({ value: UNASSIGNED_NODE, label: '未分配' })
+  return options
+}
+
+// 用户是否"不在任何层级"：未分配，或归属的节点已被删除（org_node_id 悬空）。
+// 悬空的也算进来，否则删掉一个层级就会让那批人从共享选择器里凭空消失。
+const isUnassignedUser = (user: ShareCandidate, nodes: ShareOrgNode[]) =>
+  user.orgNodeId == null || !nodes.some((node) => node.id === user.orgNodeId)
+
+// 某一层级下的用户；levelId 为 null（未选层级）时返回空 —— 不铺开整个组织的人。
+const usersInLevel = (users: ShareCandidate[], nodes: ShareOrgNode[], levelId: number | null) =>
+  levelId == null ? [] : users.filter((user) =>
+    levelId === UNASSIGNED_NODE ? isUnassignedUser(user, nodes) : user.orgNodeId === levelId)
+
+const levelLabel = (nodes: ShareOrgNode[], levelId: number | null) =>
+  levelId == null ? null : levelId === UNASSIGNED_NODE ? '未分配' : nodes.find((node) => node.id === levelId)?.name
 
 // 网页链接的地址解析。用户习惯只敲 example.com，缺协议头时补 https；已有协议头（含 http:）就原样尊重。
 // 只负责「能不能解析成 URL」，协议白名单由调用方判——mailto: 之类也能解析成功，但不是能放进 href 的网页地址。
@@ -233,6 +289,25 @@ const stripSavedSources = (contents: Record<number, ContentItem[]>, savedIds: Se
   ])
 )
 
+// 走浏览器自身的下载：把按需取回的字节挂到 <a download> 上点一下。
+// 字节来源复用已有的 getContentSrc —— 已落库的条目是 blob: URL，刚导入还没落库的是内联 data:，
+// 两者都能被 download 属性接住，所以不需要后端再加一个「下载」接口。
+// 不 acquire 引用计数：点击后浏览器立刻开始取字节，缓存的惰性回收不会在传输中途把它撤掉。
+const downloadContent = async (item: ContentItem) => {
+  try {
+    const src = await getContentSrc(item)
+    const link = document.createElement('a')
+    link.href = src
+    link.download = item.name
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  } catch (error) {
+    // 不能静默失败：点了没反应会被当成按钮坏了。文件夹/网页链接这类没有字节的条目会走到这里。
+    window.alert(error instanceof Error ? error.message : '下载失败')
+  }
+}
+
 // 进度上报节流：整数百分比变化且距上次 >120ms 才上报，避免大文件触发上百次全列表重渲染。
 // 丢弃小于上次的值——请求失败回退到 defaultApiUrl 重传时 XHR 会从 0 重来，百分比不能倒退。
 const makeProgressReporter = (report: (percent: number) => void) => {
@@ -329,10 +404,10 @@ const documentKindMeta: Record<DocumentKind, { short: string; label: string; bad
   image: { short: 'IMG', label: '图片', badge: 'bg-fuchsia-50 text-fuchsia-600', accent: 'text-fuchsia-600' },
 }
 
-// 可在线编辑的类型。刻意排除几种：.doc 走 mammoth 必然解析失败（它只认 OOXML）；
-// .xls 我们只能写回 xlsx 字节，顶着 .xls 的扩展名会让用户以为自己拿到的是老格式。
+// 可在线编辑的类型。旧版 .doc 可读取正文，并在保存时转换为 .docx；
+// .xls 同理只能写回 xlsx 字节，沿用旧扩展名会让用户误以为拿到的仍是原格式。
 const editableKindOf = (item: ContentItem, assetReady: boolean): EditableKind | null => {
-  if (!assetReady || /\.(pdf|doc|xls)$/i.test(item.name)) return null
+  if (!assetReady || /\.(pdf|xls)$/i.test(item.name)) return null
   const kind = getDocumentKind(item)
   return kind === 'pdf' || kind === 'image' ? null : kind
 }
@@ -356,8 +431,21 @@ const buildAssetPayload = async (draft: EditDraft, item: ContentItem) => {
     return { src: bytesToDataUrl(bytes, mimeType), mimeType, size: bytes.length }
   }
   if (draft.kind === 'word') {
+    if (draft.format === 'docx') {
+      const bytes = await writeDocxEdits(draft.sourceBytes, draft.paragraphs)
+      return {
+        src: bytesToDataUrl(bytes, DOCX_MIME_TYPE),
+        mimeType: DOCX_MIME_TYPE,
+        size: bytes.length,
+      }
+    }
     const bytes = await markdownToDocxBytes(draft.markdown)
-    return { src: bytesToDataUrl(bytes, DOCX_MIME_TYPE), mimeType: DOCX_MIME_TYPE, size: bytes.length }
+    return {
+      src: bytesToDataUrl(bytes, DOCX_MIME_TYPE),
+      mimeType: DOCX_MIME_TYPE,
+      size: bytes.length,
+      ...(/\.doc$/i.test(item.name) ? { name: item.name.replace(/\.doc$/i, '.docx') } : {}),
+    }
   }
   const bytes = new TextEncoder().encode(draft.text)
   const mimeType = textMimeTypeFor(item.name, item.mimeType)
@@ -462,6 +550,44 @@ const formatAssistantText = (text: string) => {
   return renderAssistantBlocks(sanitizedText, { stripRefNumbers: true })
 }
 
+// 从消息列表里回找这条回答对应的提问，写进草稿溯源；找不到也不影响打开请求。
+const draftMethodColor: Record<ApiDraftCandidate['method'], string> = {
+  GET: 'text-green-600',
+  POST: 'text-blue-600',
+  PUT: 'text-orange-500',
+  PATCH: 'text-purple-500',
+  DELETE: 'text-red-500',
+}
+
+const buildDraftOrigin = (
+  libraryId: number,
+  conversationId: string | undefined,
+  messages: ChatMessage[],
+  message: ChatMessage,
+  index: number,
+): ApiDraftOrigin => ({
+  libraryId,
+  ...(conversationId ? { conversationId } : {}),
+  messageIndex: index,
+  question: messages.slice(0, index).reverse().find((item) => item.role === 'user')?.text ?? '',
+  citationIds: message.citations?.map((citation) => citation.id) ?? [],
+})
+
+// 两个问答组件共用：草稿写进 sessionStorage 后跳转，API 测试页在 hydrate 完成后消费。
+const openApiDraftInApiTest = (
+  navigate: ReturnType<typeof useNavigate>,
+  candidate: ApiDraftCandidate,
+  origin: ApiDraftOrigin,
+) => {
+  // 目标页有权限路由；无权限时先说明，避免草稿留在 sessionStorage 里被以后误消费。
+  if (!canAccess('api_test')) {
+    window.alert('当前账号暂无 API 测试权限，请联系管理员开通')
+    return
+  }
+  if (!stashApiDraft(toApiDraft(candidate, origin))) return
+  navigate('/api-test')
+}
+
 type MessageBubbleProps = {
   message: ChatMessage
   bubbleClass?: string
@@ -472,11 +598,48 @@ type MessageBubbleProps = {
   onEditChange?: (value: string) => void
   onCancelEdit?: () => void
   onSubmitEdit?: () => void
+  onTestEndpoint?: (draft: ApiDraftCandidate) => void
 }
 
-const MessageBubble = ({ message, bubbleClass = 'max-w-full px-0 py-1', index = 0, onEdit, isEditing = false, editValue = '', onEditChange, onCancelEdit, onSubmitEdit }: MessageBubbleProps) => {
+const MessageBubble = ({ message, bubbleClass = 'max-w-full px-0 py-1', index = 0, onEdit, isEditing = false, editValue = '', onEditChange, onCancelEdit, onSubmitEdit, onTestEndpoint }: MessageBubbleProps) => {
   const [copied, setCopied] = useState(false)
+  const [copiedCurlKey, setCopiedCurlKey] = useState<string | null>(null)
   const messageContentRef = useRef<HTMLDivElement>(null)
+  const apiDrafts = message.role === 'assistant' && onTestEndpoint ? extractApiDrafts(message.text) : []
+
+  const copyCurl = async (draft: ApiDraftCandidate) => {
+    const text = toCurl(draft)
+    let success = false
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+        success = true
+      }
+    } catch {
+      // 非 HTTPS 或拒绝授权时退回 execCommand。
+    }
+    if (!success) {
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.setAttribute('readonly', '')
+      textarea.style.position = 'fixed'
+      textarea.style.left = '-9999px'
+      document.body.appendChild(textarea)
+      textarea.select()
+      try {
+        success = document.execCommand('copy')
+      } catch {
+        success = false
+      } finally {
+        document.body.removeChild(textarea)
+      }
+    }
+    if (success) {
+      const key = `${draft.method} ${draft.url}`
+      setCopiedCurlKey(key)
+      window.setTimeout(() => setCopiedCurlKey((current) => current === key ? null : current), 1500)
+    }
+  }
 
   const handleCopy = async () => {
     let success = false
@@ -543,6 +706,55 @@ const MessageBubble = ({ message, bubbleClass = 'max-w-full px-0 py-1', index = 
           {message.role === 'assistant' ? formatAssistantText(message.text) : <p className="wrap-anywhere whitespace-pre-wrap text-sm leading-7">{message.text}</p>}
         </div>
       </div>
+      {apiDrafts.length > 0 ? (
+        <details className="mt-2 w-full rounded-lg border border-base-200 bg-base-100/70 px-3 py-2">
+          <summary className="cursor-pointer select-none text-xs font-medium text-primary">
+            在 API 测试中打开接口（{apiDrafts.length}）
+          </summary>
+          <div className="mt-2 flex flex-col gap-1">
+            {apiDrafts.map((draft) => {
+              const key = `${draft.method} ${draft.url}`
+              return (
+                <div key={key} className="flex min-w-0 items-start gap-2 rounded-md px-1 py-1 hover:bg-base-200/50">
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                    title={`在 API 测试中打开 ${key}`}
+                    onClick={() => onTestEndpoint?.(draft)}
+                  >
+                    <span className={`w-12 shrink-0 pt-0.5 font-mono text-[10px] font-bold ${draftMethodColor[draft.method]}`}>{draft.method}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-mono text-xs text-base-content/80">{draft.url}</span>
+                      <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-[10px]">
+                        <span className={`rounded px-1.5 py-0.5 ${draft.confidence === 'full' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
+                          {draft.confidence === 'full' ? '完整请求' : '仅方法/路径'}
+                        </span>
+                        {draft.body ? <span className="text-base-content/40">含请求体</span> : null}
+                        {draft.headers?.length ? <span className="text-base-content/40">{draft.headers.length} 个 Header</span> : null}
+                        {draft.auth && draft.auth.type !== 'none' ? <span className="text-base-content/40">需补认证</span> : null}
+                      </span>
+                      {draft.notices?.length ? (
+                        <span className="mt-0.5 block truncate text-[10px] text-amber-600" title={draft.notices.join('；')}>
+                          {draft.notices[0]}
+                        </span>
+                      ) : null}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded px-1.5 py-1 text-[10px] text-base-content/45 transition hover:bg-base-200 hover:text-base-content"
+                    title="复制 cURL"
+                    onClick={() => void copyCurl(draft)}
+                  >
+                    {copiedCurlKey === key ? '已复制' : 'cURL'}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+          <p className="mt-2 text-[11px] text-base-content/40">完整请求会预填方法、URL、Headers、Body 和认证类型；相对路径仍需配置 Base URL。</p>
+        </details>
+      ) : null}
       <div className={`mt-2 flex items-center gap-2 ${isUser ? 'justify-end' : 'justify-start'}`}>
         <div className={`flex items-center gap-0.5 transition-opacity ${isUser ? `ml-auto opacity-100 sm:opacity-0 sm:group-hover/message:opacity-100 sm:focus-within:opacity-100 ${copied ? 'sm:opacity-100' : ''}` : ''}`}>
           {!isUser ? (
@@ -564,7 +776,10 @@ const MessageBubble = ({ message, bubbleClass = 'max-w-full px-0 py-1', index = 
               <li key={citation.id} className="flex items-start gap-1.5 text-xs leading-5">
                 <span className="shrink-0 font-semibold text-primary">[{citation.id}]</span>
                 <span className="min-w-0">
-                  <span className="font-medium text-base-content/85">{citation.title}</span>
+                  {safeCitationUrl(citation.url)
+                    ? <a href={safeCitationUrl(citation.url)} target="_blank" rel="noopener noreferrer" className="font-medium text-primary hover:underline">{citation.title}</a>
+                    : <span className="font-medium text-base-content/85">{citation.title}</span>}
+                  {citation.source === 'internet' ? <span className="ml-1.5 rounded bg-sky-50 px-1 py-0.5 text-[10px] text-sky-700">互联网</span> : null}
                   {citation.path ? <span className="text-base-content/45"> · {citation.path}</span> : null}
                 </span>
               </li>
@@ -620,21 +835,21 @@ const AssetErrorNotice = ({ title, detail }: { title: string; detail?: string })
   </div>
 )
 
-const DocumentPreviewCanvas = ({ item, zoom, sheetIndex, onSheetChange, onPageCountChange, onCurrentPageChange }: { item: ContentItem; zoom: number; sheetIndex: number; onSheetChange: (index: number) => void; onPageCountChange?: (pageCount: number) => void; onCurrentPageChange?: (page: number) => void }) => {
+const DocumentPreviewCanvas = ({ item, sheetIndex, onSheetChange, onPageCountChange, onCurrentPageChange, onTocChange }: { item: ContentItem; sheetIndex: number; onSheetChange: (index: number) => void; onPageCountChange?: (pageCount: number) => void; onCurrentPageChange?: (page: number) => void; onTocChange?: (entries: Array<{ id: string; text: string; level: number }>) => void }) => {
   const kind = getDocumentKind(item)
   const meta = documentKindMeta[kind]
+  const isLegacyWord = /\.doc$/i.test(item.name)
   const title = item.name.replace(/\.(docx?|pdf|xlsx?|csv|txt|md|markdown|json|xml|html?)$/i, '')
-  const scale = zoom / 100
   // 文件字节不在工作区里，这里按需取回（内联 data: 直接命中，已落库的走下载端点 → blob: URL）。
   // 打开期间 refs 保持 > 0，缓存回收不会把这一个撤掉，PDF 的 iframe 内部重载才不会拿到失效地址。
-  const asset: AssetState = useContentSrc(item)
+  const asset: AssetState = useContentSrc(item, !isLegacyWord)
   const src = asset.status === 'ready' ? asset.url : undefined
   const failed = asset.status === 'error' || asset.status === 'unavailable'
 
   if (kind === 'image') {
     if (failed) return <AssetErrorNotice title="图片加载失败" detail={asset.status === 'error' ? asset.error : '该条目没有可用的文件内容'} />
     if (!src) return <div className="mx-auto flex min-h-130 max-w-215 items-center justify-center rounded-lg border border-base-300 bg-base-100 text-sm text-base-content/40 shadow-sm">图片正在加载，完成后将在这里显示原图。</div>
-    return <figure className="mx-auto overflow-hidden rounded-xl border border-base-300 bg-base-100 transition-[width,max-width] duration-150" style={{ width: `${scale * 100}%`, maxWidth: `${1200 * scale}px` }}>
+    return <figure className="mx-auto w-full max-w-300 overflow-hidden rounded-xl border border-base-300 bg-base-100">
       <div className="flex min-h-105 items-center justify-center bg-[linear-gradient(45deg,#f3f4f6_25%,transparent_25%),linear-gradient(-45deg,#f3f4f6_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#f3f4f6_75%),linear-gradient(-45deg,transparent_75%,#f3f4f6_75%)] bg-size-[20px_20px] bg-position-[0_0,0_10px,10px_-10px,-10px_0px] p-5">
         <img src={src} alt={item.name} className="block h-auto max-h-[calc(100vh-220px)] max-w-full object-contain" draggable={false} />
       </div>
@@ -651,10 +866,10 @@ const DocumentPreviewCanvas = ({ item, zoom, sheetIndex, onSheetChange, onPageCo
   }
 
   // Excel / Word / Markdown / 文本：水合中也要挂载 DocumentRenderer，它会自己渲染「正在解析文档...」占位。
-  if ((kind === 'sheet' || kind === 'word' || kind === 'markdown' || kind === 'text') && (src || asset.status === 'loading')) {
-    return <div className="mx-auto origin-top transition-transform duration-150" style={{ transform: `scale(${scale})`, width: `${100 / scale}%` }}>
+  if ((kind === 'sheet' || kind === 'word' || kind === 'markdown' || kind === 'text') && (src || asset.status === 'loading' || isLegacyWord)) {
+    return <div className="mx-auto w-full">
       <div className="min-w-0 bg-base-100">
-        <DocumentRenderer item={item} src={src} onPageCountChange={onPageCountChange} onCurrentPageChange={onCurrentPageChange} />
+        <DocumentRenderer item={item} src={src} onPageCountChange={onPageCountChange} onCurrentPageChange={onCurrentPageChange} onTocChange={onTocChange} />
       </div>
     </div>
   }
@@ -669,7 +884,7 @@ const DocumentPreviewCanvas = ({ item, zoom, sheetIndex, onSheetChange, onPageCo
     const activeSheet = sheets[sheetIndex] || sheets[0]
     if (!activeSheet) return <div className="mx-auto flex min-h-130 max-w-190 items-center justify-center rounded-lg border border-base-300 bg-base-100 text-sm text-base-content/40 shadow-sm">Excel 文件正在解析，完成后将在这里显示真实工作表。</div>
 
-    return <div className="mx-auto origin-top transition-transform duration-150" style={{ transform: `scale(${scale})`, width: `${100 / scale}%` }}>
+    return <div className="mx-auto w-full">
       <div className="min-w-280 overflow-hidden rounded-lg border border-base-300 bg-base-100 shadow-sm">
         <div className="border-b border-base-200 bg-base-100 px-4 py-3">
           <p className="truncate text-xs text-base-content/40">{item.name} · {activeSheet.name}</p>
@@ -688,16 +903,16 @@ const DocumentPreviewCanvas = ({ item, zoom, sheetIndex, onSheetChange, onPageCo
   // 对于 Word 预览图片的情况（向后兼容）
   const documentPages = getDocumentPagePreviews(item)
   if (kind === 'word' && documentPages.length > 0) {
-    return <div className="mx-auto flex flex-col gap-6 transition-[width,max-width] duration-150" style={{ width: `${scale * 100}%`, maxWidth: `${840 * scale}px` }}>
+    return <div className="mx-auto flex w-full max-w-210 flex-col gap-6">
         {documentPages.map((page, index) => <figure key={page} className="overflow-hidden rounded-sm border border-base-300 bg-base-100 shadow-sm">
           <img src={page} alt={`${item.name} - 第 ${index + 1} 页`} className="block h-auto w-full select-none" draggable={false} loading={index > 1 ? 'lazy' : 'eager'} />
-          <figcaption className="border-t border-base-200 px-3 py-2 text-center text-[11px] text-base-content/35">第 {index + 1} / {documentPages.length} 页</figcaption>
+          <figcaption className="mx-10 flex items-center justify-between border-t border-base-200 py-3 text-[11px] text-base-content/45"><span>智域知识库</span><span className="tabular-nums text-base-content/60">{index + 1} / {documentPages.length}</span></figcaption>
         </figure>)}
     </div>
   }
 
   // 默认占位符（无 src 和 预览页面）
-  return <div className="mx-auto origin-top transition-transform duration-150" style={{ transform: `scale(${scale})`, width: `${100 / scale}%` }}>
+  return <div className="mx-auto w-full">
     <article className="mx-auto min-h-190 max-w-190 rounded-sm border border-base-200 bg-base-100 px-12 py-14 shadow-sm md:px-16">
       <div className="mb-10 flex items-center justify-between text-xs text-base-content/35"><span>{meta.label} · {formatContentUpdatedAt(item.updatedAt)}</span><span>第 1 页</span></div>
       <h1 className="text-3xl font-semibold leading-tight tracking-tight text-base-content">{title}</h1>
@@ -708,7 +923,7 @@ const DocumentPreviewCanvas = ({ item, zoom, sheetIndex, onSheetChange, onPageCo
         <p>文档预览支持保持原有标题层级、正文段落和分页结构。解析服务接入后，这里将展示文件中的真实内容、图片和表格。</p>
         <div className="rounded-xl border-l-4 border-blue-400 bg-base-200/40 px-5 py-4"><p className="text-sm">你可以在右侧知识助手中总结文档、提取重点，或针对当前文档继续提问。</p></div>
         <h2 className="pt-3 text-xl font-semibold text-base-content">主要内容</h2>
-        <p>预览区域将根据页面宽度自动居中，支持缩放和适应页面，阅读过程中不会影响左侧知识库与内容列表的操作。</p>
+        <p>预览区域将根据页面宽度自动居中，阅读过程中不会影响左侧知识库与内容列表的操作。</p>
       </div>
     </article>
   </div>
@@ -729,6 +944,7 @@ export function KnowledgeDocument() {
       library: params.get('library') || '知识库',
       libraryId: Number(params.get('libraryId') || 0),
       parent: params.get('parent') || undefined,
+      readonly: params.get('readonly') === '1',
     }
   })
   const [item, setItem] = useState<ContentItem>(() => ({
@@ -744,12 +960,17 @@ export function KnowledgeDocument() {
     ...(lookup.id ? { hasAsset: true } : {}),
   }))
   const libraryName = lookup.library
-  const [previewZoom, setPreviewZoom] = useState(100)
   const [previewSheetIndex, setPreviewSheetIndex] = useState(0)
   const [renderedPageCount, setRenderedPageCount] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
+  const [previewFullscreen, setPreviewFullscreen] = useState(false)
+  const [previewToc, setPreviewToc] = useState<Array<{ id: string; text: string; level: number }>>([])
+  const [selectedTocId, setSelectedTocId] = useState('')
+  const [collapsedToc, setCollapsedToc] = useState<Set<string>>(() => new Set())
+  const previewScrollRef = useRef<HTMLDivElement>(null)
   const [assistantOpen, setAssistantOpen] = useState(true)
   const [question, setQuestion] = useState('')
+  const [webSearch, setWebSearch] = useState(false)
   const [documentConversations, setDocumentConversations] = useState<Conversation[]>([])
   const [activeDocumentConversationId, setActiveDocumentConversationId] = useState<string | null>(null)
   const [documentHistoryOpen, setDocumentHistoryOpen] = useState(false)
@@ -762,15 +983,75 @@ export function KnowledgeDocument() {
   const activeDocumentConversation = documentConversations.find((conversation) => conversation.id === activeDocumentConversationId) ?? documentConversations[0] ?? null
   const messages = activeDocumentConversation?.messages ?? []
   const kind = getDocumentKind(item)
+  const navigate = useNavigate()
+  const openInApiTest = (candidate: ApiDraftCandidate, message: ChatMessage, index: number) => {
+    openApiDraftInApiTest(
+      navigate,
+      candidate,
+      buildDraftOrigin(lookup.libraryId, activeDocumentConversation?.id, messages, message, index),
+    )
+  }
   const pageCount = renderedPageCount || getDocumentPagePreviews(item).length
-  const sheetCount = getWorkbookSheetPreviews(item).length
+
+  useEffect(() => {
+    const title = item.name || lookup.name || '未命名文档'
+    document.title = title
+    return () => {
+      document.title = '智域'
+    }
+  }, [item.name, lookup.name])
+
   const handlePageCountChange = useCallback((nextPageCount: number) => {
     setRenderedPageCount((current) => current === nextPageCount ? current : nextPageCount)
   }, [])
 
+  const handleTocChange = useCallback((nextToc: typeof previewToc) => {
+    setPreviewToc(nextToc)
+  }, [])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setPreviewFullscreen(false) }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  const jumpToPage = (page: number) => {
+    const bounded = Math.min(pageCount, Math.max(1, page))
+    setCurrentPage(bounded)
+    const scroller = previewScrollRef.current
+    if (scroller) scroller.scrollTo({ top: (bounded - 1) / Math.max(pageCount, 1) * (scroller.scrollHeight - scroller.clientHeight), behavior: 'smooth' })
+  }
+
+  const navigateToHeading = (event: MouseEvent<HTMLAnchorElement>) => {
+    event.preventDefault()
+    const headingIndex = Number(event.currentTarget.dataset.headingIndex)
+    if (!Number.isInteger(headingIndex) || headingIndex < 0) return
+    const id = event.currentTarget.dataset.headingId
+    if (id) setSelectedTocId(`${item.id}:${id}`)
+
+    const previewScroller = previewScrollRef.current
+    const headings = previewScroller?.querySelectorAll<HTMLElement>(
+      '.markdown-preview h1, .markdown-preview h2, .markdown-preview h3, .word-content h1, .word-content h2, .word-content h3, .word-content h4, .word-content h5, .word-content h6',
+    )
+    const heading = headings?.[headingIndex]
+    heading?.scrollIntoView({ behavior: 'smooth', block: 'start', inline: 'nearest' })
+  }
+
   // 文件字节由水合层按需取回，item.src 通常一直是空的，所以这里盯的是解析出来的地址。
-  const documentAsset = useContentSrc(item)
+  const documentAsset = useContentSrc(item, !/\.doc$/i.test(item.name))
   const documentSrc = documentAsset.status === 'ready' ? documentAsset.url : undefined
+  const isLegacyWord = /\.doc$/i.test(item.name)
+
+  // 换文档（含上传后拿到新地址）就把翻页重置回第一页。用 React 文档里「渲染期按上一次的值调整
+  // 状态」的写法，而不是 effect：effect 在 paint 之后才跑，会先把上一份文档的页数/页码画出来再
+  // 纠正 —— 旧文档停在第 5 页、新文档只有 1 页时会闪一下；放在渲染期则一次到位，还少一轮渲染。
+  // 判据逐项比而不是拼成一个字符串：拼接得靠分隔符，而分隔符本身可能出现在文档名里。
+  const [pagingSource, setPagingSource] = useState<[string, string, string | undefined]>([item.id, item.name, documentSrc])
+  if (pagingSource[0] !== item.id || pagingSource[1] !== item.name || pagingSource[2] !== documentSrc) {
+    setPagingSource([item.id, item.name, documentSrc])
+    setRenderedPageCount(0)
+    setCurrentPage(1)
+  }
 
   // —— 编辑态 ——
   // 独立页是另一个浏览器标签页，编辑态自成一套，不复用列表页的任何状态。
@@ -780,23 +1061,36 @@ export function KnowledgeDocument() {
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  const editableKind = editableKindOf(item, documentAsset.status === 'ready')
+  const editableKind = lookup.readonly ? null : editableKindOf(item, (isLegacyWord && Boolean(item.hasAsset || item.src)) || documentAsset.status === 'ready')
 
   // 字节不必重下：documentSrc 就是已水合的 blob: URL，直接喂给解析器。
   const beginEdit = async () => {
-    if (!documentSrc || !editableKind || editLoading) return
+    if ((!documentSrc && !isLegacyWord) || !editableKind || editLoading) return
     setEditLoading(true)
     setSaveError(null)
     try {
       if (editableKind === 'sheet') {
+        if (!documentSrc) throw new Error('文件内容不可用')
         const sheets = await parseExcelFile(documentSrc)
         if (!sheets.length) throw new Error('该文件没有可编辑的工作表')
         setDraft({ kind: 'sheet', sheets, activeSheet: 0 })
       } else if (editableKind === 'word') {
-        // Word 以 Markdown 为编辑面：mammoth 只负责 DOCX→HTML，这里再降一层。
-        const parsed = await parseWordDocument(documentSrc)
-        setDraft({ kind: 'word', markdown: htmlToMarkdown(parsed.html) })
+        if (isLegacyWord) {
+          const result = await getLegacyWordText(item.id)
+          if (!result.success || !result.data) throw new Error(result.error || '旧版 .doc 文档解析失败')
+          setDraft({ kind: 'word', format: 'legacy', markdown: result.data.text })
+        } else {
+          const response = await fetch(documentSrc!)
+          if (!response.ok) throw new Error(`文档读取失败（${response.status}）`)
+          setDraft(await readDocxForEditing(await response.arrayBuffer()).then((docx) => ({
+            kind: 'word',
+            format: 'docx',
+            sourceBytes: docx.sourceBytes,
+            paragraphs: docx.paragraphs,
+          })))
+        }
       } else {
+        if (!documentSrc) throw new Error('文件内容不可用')
         const response = await fetch(documentSrc)
         if (!response.ok) throw new Error(`文件读取失败（${response.status}）`)
         setDraft({ kind: 'text', text: await response.text() })
@@ -823,7 +1117,7 @@ export function KnowledgeDocument() {
   const handleDraftChange = useCallback((updater: (current: EditDraft) => EditDraft) => {
     setDraft((current) => (current ? updater(current) : current))
     setDirty(true)
-  }, [])
+  }, [setDraft, setDirty])
 
   const saveEdit = async () => {
     // 认 item.id 而不是 lookup.id：老链接不带 id，但条目可能已经从工作区里按名字匹配回来了，
@@ -839,7 +1133,8 @@ export function KnowledgeDocument() {
       // 不主动失效的话预览会一直停在旧内容上。
       invalidateContentAsset(item.id)
       const stamp = result.data?.contentUpdatedAt ?? new Date().toISOString()
-      setItem((current) => ({ ...current, mimeType: payload.mimeType, size: payload.size, updatedAt: stamp, contentUpdatedAt: stamp }))
+      const savedName = result.data?.name || ('name' in payload ? payload.name : undefined)
+      setItem((current) => ({ ...current, ...(savedName ? { name: savedName } : {}), mimeType: payload.mimeType, size: payload.size, updatedAt: stamp, contentUpdatedAt: stamp }))
       setEditing(false)
       setDraft(null)
       setDirty(false)
@@ -857,11 +1152,6 @@ export function KnowledgeDocument() {
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)
   }, [dirty])
-
-  useEffect(() => {
-    setRenderedPageCount(0)
-    setCurrentPage(1)
-  }, [item.id, documentSrc, item.name])
 
   useEffect(() => {
     // 链接里带了 content_key 就不必再拉整个工作区——文件本身已经能按需下载。
@@ -930,7 +1220,7 @@ export function KnowledgeDocument() {
     setAsking(true)
     const controller = new AbortController()
     setAbortController(controller)
-    const result = await askKnowledge(lookup.libraryId, text, history, controller.signal, { level: 'document', libraryId: lookup.libraryId, name: item.name, parent: item.parent || '' })
+    const result = await askKnowledge(lookup.libraryId, text, history, controller.signal, { level: 'document', libraryId: lookup.libraryId, name: item.name, parent: item.parent || '' }, webSearch)
     if (controller.signal.aborted) return
     const citations = result.success && result.data ? result.data.citations : []
     const assistantMessage = { role: 'assistant' as const, text: result.success && result.data ? result.data.answer : `问答失败：${result.error || '未知错误'}`, createdAt: new Date().toISOString(), ...(citations.length ? { citations } : {}) }
@@ -968,8 +1258,7 @@ export function KnowledgeDocument() {
       <div className="min-w-0 flex-1"><h1 className="truncate text-sm font-medium">{item.name}</h1><p className="mt-0.5 truncate text-[11px] text-base-content/35">{libraryName} · {formatContentUpdatedAt(item.updatedAt)}</p></div>
       <button onClick={() => setAssistantOpen((open) => !open)} className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs transition hover:bg-base-200 ${assistantOpen ? 'bg-emerald-50 text-emerald-700' : 'text-base-content/50'}`}><span className="flex h-5 w-5 items-center justify-center rounded-md bg-linear-to-br from-lime-300 to-emerald-400 text-[9px] font-bold text-emerald-950">AI</span>AI 助手</button>
       {editableKind ? <button onClick={() => void beginEdit()} disabled={editLoading || editing} className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs transition hover:bg-base-200 disabled:cursor-not-allowed disabled:opacity-60 ${editing ? 'bg-primary/10 text-primary' : 'text-base-content/50'}`} title="编辑文档" aria-label="编辑文档">{editLoading ? <span className="loading loading-spinner loading-xs" /> : <Icon><path d="M13.5 6.5 17.5 10.5" /><path d="M4 20h4l11-11a2.83 2.83 0 0 0-4-4L4 16v4Z" /></Icon>}编辑</button> : null}
-      <button className="rounded-lg p-2 text-base-content/45 hover:bg-base-200" title="下载文档"><Icon><path d="M12 3v12m-4-4 4 4 4-4" /><path d="M5 21h14" /></Icon></button>
-      <button onClick={() => window.close()} className="rounded-lg p-2 text-base-content/45 hover:bg-base-200" title="关闭标签页"><Icon><path d="M18 6 6 18M6 6l12 12" /></Icon></button>
+      <button onClick={() => void downloadContent(item)} disabled={!item.hasAsset && !item.src} className="rounded-lg p-2 text-base-content/45 transition hover:bg-base-200 disabled:opacity-30" title="下载文档" aria-label="下载文档"><Icon><path d="M12 3v12m-4-4 4 4 4-4" /><path d="M5 21h14" /></Icon></button>
     </header>
     <div className="flex min-h-0 flex-1">
       <main className="flex min-w-0 flex-1 flex-col">
@@ -986,19 +1275,52 @@ export function KnowledgeDocument() {
             {draft && editableKind ? <DocumentEditor kind={editableKind} itemName={item.name} draft={draft} onChange={handleDraftChange} /> : <div className="flex flex-1 items-center justify-center"><span className="loading loading-spinner loading-lg" /></div>}
           </div>
         </> : <>
-        <div className="flex h-11 shrink-0 items-center justify-between border-b border-base-200 bg-base-100 px-5 text-xs text-base-content/45">
+        <div className={`${previewFullscreen ? 'fixed inset-0 z-50 flex h-screen w-screen flex-col bg-base-100' : 'flex min-h-0 flex-1 flex-col'} border-b border-base-200`}>
+        <div className="flex h-11 shrink-0 items-center justify-between px-5 text-xs text-base-content/45">
           <span>文档预览</span>
-          {kind === 'pdf' ? <span>使用 PDF 工具栏缩放、翻页和搜索</span> : <div className="flex items-center gap-1">
-            <button onClick={() => setPreviewZoom((value) => Math.max(70, value - 10))} disabled={previewZoom <= 70} className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-base-200 disabled:opacity-30" title="缩小">−</button>
-            <span className="w-12 text-center tabular-nums">{previewZoom}%</span>
-            <button onClick={() => setPreviewZoom((value) => Math.min(140, value + 10))} disabled={previewZoom >= 140} className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-base-200 disabled:opacity-30" title="放大">＋</button>
-            <button onClick={() => setPreviewZoom(100)} className="ml-1 rounded-md px-2 py-1.5 hover:bg-base-200">适应页面</button>
-          </div>}
-          <span>{kind === 'pdf' ? 'PDF 预览' : kind === 'sheet' ? `工作表 ${previewSheetIndex + 1} / ${Math.max(sheetCount, 1)}` : kind === 'markdown' ? 'Markdown 预览' : kind === 'image' ? '图片预览' : `第 ${Math.min(currentPage, Math.max(pageCount, 1))} / ${Math.max(pageCount, 1)} 页`}</span>
+          {kind === 'pdf' ? <span>使用 PDF 工具栏缩放、翻页和搜索</span> : null}
+          <div className="flex items-center gap-2">
+            {pageCount > 0 && kind !== 'pdf' && kind !== 'sheet' ? <div className="flex items-center gap-1"><button onClick={() => jumpToPage(currentPage - 1)} disabled={currentPage <= 1} className="rounded px-2 py-1 hover:bg-base-200 disabled:opacity-30" aria-label="上一页">‹</button><input aria-label="跳转到页码" type="number" min={1} max={pageCount} value={currentPage} onChange={(event) => jumpToPage(Number(event.target.value) || 1)} className="w-12 rounded border border-base-300 bg-base-100 px-1 py-1 text-center"/><span>/ {pageCount}</span><button onClick={() => jumpToPage(currentPage + 1)} disabled={currentPage >= pageCount} className="rounded px-2 py-1 hover:bg-base-200 disabled:opacity-30" aria-label="下一页">›</button></div> : null}
+            <button onClick={() => setPreviewFullscreen((value) => !value)} className="rounded px-2 py-1 hover:bg-base-200" title={previewFullscreen ? '退出全屏（Esc）' : '全屏预览'}>{previewFullscreen ? '退出全屏' : '全屏'}</button>
+          </div>
         </div>
-        <div data-document-preview-scroll className="flex-1 overflow-auto bg-base-100 px-6 py-8" style={{ paddingBottom: 'clamp(12rem, 45vh, 28rem)' }}>
-          <DocumentPreviewCanvas item={item} zoom={previewZoom} sheetIndex={previewSheetIndex} onSheetChange={setPreviewSheetIndex} onPageCountChange={handlePageCountChange} onCurrentPageChange={setCurrentPage} />
+        <div className="flex min-h-0 flex-1">
+        {previewFullscreen || previewToc.length > 0 ? <nav aria-label="文档目录" className={`${previewFullscreen ? 'flex' : 'hidden sm:flex'} w-64 shrink-0 flex-col overflow-y-auto border-r border-base-200 bg-base-100`}>
+          <div className="border-b border-base-200 px-4 py-4"><div className="text-sm font-semibold text-base-content/80">{item.name}</div><div className="mt-1 text-[11px] text-base-content/40">文档目录</div></div>
+          <div className="flex-1 overflow-y-auto px-2 py-3">
+            {previewToc.length ? (() => {
+              return previewToc.map((entry, index) => {
+              const hiddenByParent = previewToc.slice(0, index).some((candidate, candidateIndex) => candidate.level < entry.level && collapsedToc.has(candidate.id) && previewToc.slice(candidateIndex + 1, index).every((middle) => middle.level > candidate.level))
+              const hasChildren = previewToc[index + 1]?.level > entry.level
+              if (hiddenByParent) return null
+              return <div key={entry.id} className="flex items-center gap-1" style={{ paddingLeft: `${Math.max(0, entry.level - 1) * 14}px` }}>
+                {hasChildren ? <button onClick={() => setCollapsedToc((current) => {
+                  const next = new Set(current)
+                  if (next.has(entry.id)) next.delete(entry.id)
+                  else next.add(entry.id)
+                  return next
+                })} className="flex h-6 w-6 shrink-0 items-center justify-center self-center rounded text-base-content/50 hover:bg-base-200" aria-label={collapsedToc.has(entry.id) ? '展开章节' : '折叠章节'}>
+                  <svg viewBox="0 0 12 12" className={`h-3 w-3 fill-current ${collapsedToc.has(entry.id) ? '' : 'rotate-90'}`} aria-hidden="true"><path d="M3 1.5 10 6l-7 4.5z" /></svg>
+                </button> : <span className="w-6 shrink-0" />}
+                <a
+                  href={`#${entry.id}`}
+                  data-heading-id={entry.id}
+                  data-heading-index={index}
+                  onClick={navigateToHeading}
+                  aria-current={selectedTocId === `${item.id}:${entry.id}` ? 'location' : undefined}
+                  className={`min-w-0 flex-1 truncate rounded px-2 py-1.5 text-left text-xs transition-colors ${selectedTocId === `${item.id}:${entry.id}` ? 'bg-primary/10 text-primary' : 'text-base-content/70 hover:bg-primary/8 hover:text-primary'}`}
+                  title={entry.text}
+                >
+                  {entry.text}
+                </a>
+              </div>
+            })})() : <div className="px-3 py-2 text-xs leading-5 text-base-content/40">该文档暂时没有可识别的标题目录</div>}
+          </div>
+        </nav> : null}
+        <div ref={previewScrollRef} data-document-preview-scroll className="min-h-0 flex-1 scroll-smooth overflow-auto bg-base-100 px-6 py-8">
+          <DocumentPreviewCanvas item={item} sheetIndex={previewSheetIndex} onSheetChange={setPreviewSheetIndex} onPageCountChange={handlePageCountChange} onCurrentPageChange={setCurrentPage} onTocChange={handleTocChange} />
         </div>
+        </div></div>
         </>}
       </main>
       {assistantOpen ? <AssistantResizeHandle onPointerDown={startAssistantResize} /> : null}
@@ -1017,14 +1339,14 @@ export function KnowledgeDocument() {
           </div> : messages.length === 0 ? <div className="space-y-4">
             <p className="text-sm leading-6 text-base-content/60">你好，我是你的 AI 助手。可以基于当前文档帮你总结内容、提取重点或回答问题。</p>
             <div className="grid gap-2">{['总结这篇文档', '提取文档重点', '根据文档生成测验'].map((prompt) => <button key={prompt} onClick={() => setQuestion(prompt)} className="rounded-xl border border-base-200 px-3 py-2.5 text-left text-xs text-base-content/55 hover:border-primary/25 hover:bg-primary/5 hover:text-primary">{prompt}</button>)}</div>
-          </div> : <div className="space-y-4">{messages.map((message, index) => <MessageBubble key={`${message.role}-${index}`} message={message} index={index} onEdit={asking ? undefined : (currentMessage, currentIndex) => { setQuestion(currentMessage.text); setEditingMessageIndex(currentIndex) }} isEditing={editingMessageIndex === index} editValue={question} onEditChange={setQuestion} onCancelEdit={() => { setEditingMessageIndex(null); setQuestion('') }} onSubmitEdit={() => { void askDocument() }} />)}<div ref={messagesEndRef} /></div>}
+          </div> : <div className="space-y-4">{messages.map((message, index) => <MessageBubble key={`${message.role}-${index}`} message={message} index={index} onEdit={asking ? undefined : (currentMessage, currentIndex) => { setQuestion(currentMessage.text); setEditingMessageIndex(currentIndex) }} isEditing={editingMessageIndex === index} editValue={question} onEditChange={setQuestion} onCancelEdit={() => { setEditingMessageIndex(null); setQuestion('') }} onSubmitEdit={() => { void askDocument() }} onTestEndpoint={(draft) => openInApiTest(draft, message, index)} />)}<div ref={messagesEndRef} /></div>}
         </div>
         <div className="shrink-0 border-t border-base-200 p-4">
           {asking ? <div className="mb-3 flex items-center justify-between rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700"><span>正在生成回答…</span><button type="button" onClick={stopGeneration} className="rounded-md bg-white px-2 py-1 font-medium">停止</button></div> : null}
           <div className="mb-3 rounded-xl bg-linear-to-r from-emerald-50 to-lime-100 p-3"><div className="flex min-w-0 items-center gap-2"><span className={`text-xs font-bold ${documentKindMeta[kind].accent}`}>{documentKindMeta[kind].short}</span><span className="truncate text-xs font-medium">{item.name}</span></div></div>
           {editingMessageIndex === null ? <form onSubmit={askDocument} className="rounded-2xl border border-base-300 bg-base-100 p-3 shadow-md focus-within:border-primary/40">
             <textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} rows={3} className="w-full resize-none bg-transparent text-sm leading-6 outline-none" placeholder="针对当前文档提问" />
-            <div className="mt-2 flex items-center justify-between"><button type="button" className="rounded-lg bg-base-200 px-2.5 py-1.5 text-xs text-base-content/60">快速回答⌄</button><button type="submit" disabled={!question.trim()} className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-content disabled:bg-base-300 disabled:text-base-content/30" aria-label="发送"><Icon><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></Icon></button></div>
+            <div className="mt-2 flex items-center justify-between"><div className="flex items-center gap-3"><button type="button" className="rounded-lg bg-base-200 px-2.5 py-1.5 text-xs text-base-content/60">快速回答⌄</button><label className={`flex items-center gap-1.5 text-xs text-base-content/60 ${asking ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'}`} title="开启后结合互联网搜索结果作答并附上来源；需后端配置搜索服务"><input type="checkbox" className="toggle toggle-primary toggle-xs" checked={webSearch} disabled={asking} onChange={(event) => setWebSearch(event.target.checked)} /><span>联网搜索</span></label></div><button type="submit" disabled={!question.trim()} className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-content disabled:bg-base-300 disabled:text-base-content/30" aria-label="发送"><Icon><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></Icon></button></div>
           </form> : null}
           <p className="mt-2 text-center text-[10px] text-base-content/25">内容由 AI 生成，仅供参考</p>
         </div>
@@ -1036,6 +1358,9 @@ export function KnowledgeDocument() {
 export default function Knowledge() {
   const workspaceRef = useRef<HTMLDivElement>(null)
   const persistVersionRef = useRef(0)
+  // 共享库排序单独一个版本号。不能复用 persistVersionRef：那个是**整份工作区**保存链的序号，
+  // 混用会让一次拖拽把正在回读的工作区保存判成"被取代"，静默丢掉回读结果。
+  const sharedOrderVersionRef = useRef(0)
   // 保存的串行链，见 persistWorkspace 里的说明。
   const persistChainRef = useRef<Promise<void>>(Promise.resolve())
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -1046,10 +1371,30 @@ export default function Knowledge() {
   const rowMenu = useRowMenu()
   const dragRef = useRef<{ pane: 'left' | 'middle'; startX: number; startWidth: number } | null>(null)
   const idCounterRef = useRef(1_000_000_000)
-  const [leftWidth, setLeftWidth] = useState(230)
+  // 初值跟 API 测试页的「接口信息」栏对齐（ApiTest.tsx 的 collectionPaneWidth 初值 280）。
+  // 两页左栏是同一种东西（h-14 标题 + 纵向列表），默认宽度不一致时来回切页会看到左栏忽宽忽窄。
+  // 只对初值，不对拖动范围：钳制值要按各自右栏压到多窄算（ApiTest 里是 BROWSER_PANE_MIN，
+  // 这里是 middleWidth），照抄会把一侧的版式约束塞给另一侧。
+  const [leftWidth, setLeftWidth] = useState(280)
   const [middleWidth, setMiddleWidth] = useState(410)
   const [resizing, setResizing] = useState(false)
   const [libraries, setLibraries] = useState<Library[]>([])
+  // —— 共享知识库（一期：全员只读） ——
+  // 收到的共享库与私有快照分开放置：sharedWorkspace 只进展示层，绝不进 PUT /workspace。
+  const [sharedLibraries, setSharedLibraries] = useState<SharedLibrary[]>([])
+  const [sharedContents, setSharedContents] = useState<Record<number, ContentItem[]>>({})
+  // outgoing 授权行按 libraryId 索引（**每库一个数组**：全员行 + 若干点名行）。
+  // 徽标、取消入口、弹窗草稿全部从这里实时派生，不往 libraries 上盖章（见 Library 类型注释）。
+  const [outgoingByLibrary, setOutgoingByLibrary] = useState<Map<number, KnowledgeShareEntry[]>>(() => new Map())
+  const [shareCandidates, setShareCandidates] = useState<ShareCandidate[]>([])
+  // 组织架构索引（与候选名单同源，见 listShareCandidates 注释）：「指定用户」用它做级联下拉。
+  const [shareOrgNodes, setShareOrgNodes] = useState<ShareOrgNode[]>([])
+  const [shareDialogLibraryId, setShareDialogLibraryId] = useState<number | null>(null)
+  // 弹窗内的一次性草稿：勾选的点名用户集合 + 层级下拉选中的节点。打开/每次保存后重置。
+  const [sharePicked, setSharePicked] = useState<Set<number>>(() => new Set())
+  const [shareLevelId, setShareLevelId] = useState<number | null>(null)
+  const [shareBusy, setShareBusy] = useState(false)
+  const [shareError, setShareError] = useState<string | null>(null)
   // 拖拽中的知识库。载荷里存 section 而不是到 dragover 时现查 libraries：分组判定要跟渲染这一行
   // 的 type 走（'personal' 要兜底），现查既多一次 O(n) 查找，又得把 type 的缺省再写一遍。
   const [dragPayload, setDragPayload] = useState<{ id: number; section: string } | null>(null)
@@ -1070,7 +1415,6 @@ export default function Knowledge() {
   const [query, setQuery] = useState('')
   const [currentFolder, setCurrentFolder] = useState<string | null>(null)
   const [selectedDocument, setSelectedDocument] = useState<ContentItem | null>(null)
-  const [previewZoom, setPreviewZoom] = useState(100)
   const [previewSheetIndex, setPreviewSheetIndex] = useState(0)
   const [documentAssistantOpen, setDocumentAssistantOpen] = useState(false)
   const { assistantWidth: documentAssistantWidth, startAssistantResize: startDocumentAssistantResize } = useAssistantPaneResize(defaultAssistantPaneWidth())
@@ -1104,22 +1448,44 @@ export default function Knowledge() {
   const [creatingLibraryType, setCreatingLibraryType] = useState<'personal' | 'shared' | 'subscribed'>('personal')
   const [newLibraryName, setNewLibraryName] = useState('')
   const [newLibraryCover, setNewLibraryCover] = useState('neural')
+  // 新建知识库时顺带勾选共享对象（可选）：创建后立即共享，弹窗内一次性草稿，打开时重置。
+  const [createSharePicked, setCreateSharePicked] = useState<Set<number>>(() => new Set())
+  const [createShareOrgNodes, setCreateShareOrgNodes] = useState<ShareOrgNode[]>([])
+  const [createShareLevelId, setCreateShareLevelId] = useState<number | null>(null)
+  const [createShareCandidates, setCreateShareCandidates] = useState<ShareCandidate[]>([])
+  const [createShareBusy, setCreateShareBusy] = useState(false)
+  const [createShareError, setCreateShareError] = useState<string | null>(null)
   const [addingContentLibraryId, setAddingContentLibraryId] = useState<number | null>(null)
   // 上传进度拆成两份状态：pendingIds 只在批次开始/结束时变化，是 visibleContents 的依赖；
   // 百分比放在 uploadTasks 里，只被进度行读取——否则每跳一个百分点都要重排整个内容列表。
   const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([])
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(() => new Set())
   const [newContentName, setNewContentName] = useState('')
-  const [newContentType, setNewContentType] = useState<ContentItem['type']>('folder')
+  const [newContentType, setNewContentType] = useState<ContentItem['type'] | 'text' | 'sheet'>('folder')
   const [newContentError, setNewContentError] = useState<string | null>(null)
+  const [addingContentBusy, setAddingContentBusy] = useState(false)
   const [sectionTitles, setSectionTitles] = useState<Record<string, string>>({ personal: '个人知识库', shared: '共享知识库', subscribed: '订阅知识库' })
   const [customCollections, setCustomCollections] = useState<string[]>([])
   const [question, setQuestion] = useState('')
+  const [webSearch, setWebSearch] = useState(false)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ personal: true, shared: true, subscribed: true })
   const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null)
   const [editingConversationId, setEditingConversationId] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const active = activeId == null ? undefined : libraries.find((item) => item.id === activeId)
+  // 当前选中的是否为收到的共享库（只读态的总开关）。
+  const activeShared = activeId == null ? undefined : sharedLibraries.find((item) => item.id === activeId)
+  const isSharedActive = activeShared !== undefined
+  // 选中的库名。**必须同时查私有和共享两处**：`active` 只在私有的 libraries 里找，
+  // 选中的若是收到的共享库，它必然是 undefined —— 曾因此在共享库里显示成「基于「」问答」。
+  // 两者都 undefined 时才是空串（未选中任何库）。
+  const activeName = active?.name || activeShared?.name || ''
+  // 内容列表的数据源按选中类型分流：私有 contentMap / 共享 sharedContents。
+  // useMemo 包一层：裸表达式每次渲染都是新数组，会让下游 visibleContents 的 memo 失效。
+  const contentsForActive = useMemo(
+    () => (activeId == null ? [] : isSharedActive ? sharedContents[activeId] ?? [] : contentMap[activeId] ?? []),
+    [activeId, isSharedActive, sharedContents, contentMap]
+  )
   const visibleLibraries = useMemo(() => libraries.filter((item) => `${item.name}${item.description}`.toLowerCase().includes(libraryQuery.toLowerCase())), [libraries, libraryQuery])
   const getCollectionLibraryIds = (key: string) => libraries.filter((library) => (library.type || 'personal') === key).map((library) => library.id)
   // 问答面板范围自适应：选中集合 > 进入文件夹 > 选中知识库
@@ -1137,17 +1503,32 @@ export default function Knowledge() {
   const scopeConversations = activeScope ? (conversationsByScope[scopeKey(activeScope)] ?? []) : []
   const activeConversation = scopeConversations[0] ?? null
   const messages = activeConversation?.messages ?? []
+  const navigate = useNavigate()
+  const openInApiTest = (candidate: ApiDraftCandidate, message: ChatMessage, index: number) => {
+    openApiDraftInApiTest(
+      navigate,
+      candidate,
+      buildDraftOrigin(
+        activeScope?.level === 'collection' ? activeScope.libraryIds[0] ?? 0 : activeScope?.libraryId ?? 0,
+        activeConversation?.id,
+        messages,
+        message,
+        index,
+      ),
+    )
+  }
   // 编辑态只属于其发起时所在的会话；切走会话/作用域后自动失效，无需 effect 重置
   const editingActive = editingMessageIndex !== null && editingConversationId != null && editingConversationId === activeConversation?.id
   const scopeLabel = (scope: QaScope): string => {
     if (scope.level === 'collection') return `基于「${sectionTitles[scope.key] || '知识库集合'}」集合问答`
-    if (scope.level === 'folder') return `基于「${active?.name || ''} / ${scope.folder}」问答`
-    return `基于「${active?.name || ''}」问答`
+    if (scope.level === 'folder') return `基于「${activeName} / ${scope.folder}」问答`
+    return `基于「${activeName}」问答`
   }
   const inputDisabled = !activeScope || (activeScope.level === 'collection' && !activeScope.libraryIds.length)
   const inputPlaceholder = !activeScope ? '请先选择知识库或集合' : activeScope.level === 'collection' ? (activeScope.libraryIds.length ? '基于集合提问' : '该集合暂无知识库') : activeScope.level === 'folder' ? '基于文件夹提问' : '基于知识库提问'
   const visibleContents = useMemo(() => {
-    const allItems = activeId == null ? [] : contentMap[activeId] ?? []
+    // 共享库的内容来自只读快照（sharedContents），与私有 contentMap 分流；排序规则完全一致。
+    const allItems = contentsForActive
     const actualCount = (item: ContentItem) => {
       if (item.type !== 'folder') return 1
       const path = item.parent ? `${item.parent}/${item.name}` : item.name
@@ -1165,7 +1546,7 @@ export default function Knowledge() {
       if (sortKey === 'created') return right.index - left.index
       return new Date(right.item.updatedAt).getTime() - new Date(left.item.updatedAt).getTime() || left.index - right.index
     }).map(({ item }) => item)
-  }, [activeId, contentMap, currentFolder, query, sortKey, pendingIds])
+  }, [contentsForActive, currentFolder, query, sortKey, pendingIds])
 
   // 进度行钉在列表顶部，不参与排序；过滤条件与真实行保持一致（同一层、同一搜索词）。
   const visibleUploads = useMemo(() => {
@@ -1235,6 +1616,13 @@ export default function Knowledge() {
   // 让每一份快照都建立在上一份的结果之上——放在这一层而不是各调用方，11 个调用点一次性都受保护。
   const persistWorkspace = (nextLibraries: Library[], nextContents = contentMap, nextGroups = getGroups(), selectionName = selectedLibraryName, onProgress?: (ratio: number) => void): Promise<{ success: boolean }> => {
     // 版本号留在链外：它要按「调用先后」发，不是按「实际执行先后」发。
+    // 前端防线（后端 assertSnapshotsOwnedBy 会 404 拒绝，这里不让它有机会发生）：
+    // 共享库 id 绝不允许进私有快照，否则会被服务端当新库克隆。
+    let guardedLibraries = nextLibraries
+    const sharedIds = new Set(sharedLibraries.map((library) => library.id))
+    if (guardedLibraries.some((library) => sharedIds.has(library.id))) {
+      guardedLibraries = guardedLibraries.filter((library) => !sharedIds.has(library.id))
+    }
     const version = ++persistVersionRef.current
     setSyncState('saving')
     const run = persistChainRef.current.then(() => (async () => {
@@ -1243,7 +1631,7 @@ export default function Knowledge() {
         ? {
           assetWire: 2,
           groups: nextGroups,
-          libraries: nextLibraries,
+          libraries: guardedLibraries,
           contents: Object.fromEntries(Object.entries(nextContents).map(([libraryId, items]) => [libraryId, items.map(serializeContentItem)])),
         }
         : { groups: nextGroups, libraries: nextLibraries, contents: nextContents }
@@ -1296,7 +1684,7 @@ export default function Knowledge() {
 
   const saveLibraryProfile = (id: number) => {
     const name = editingLibraryName.trim()
-    if (!name) return
+    if (!name || sharedLibraries.some((library) => library.id === id)) return
     const previousName = libraries.find((library) => library.id === id)?.name
     const wasSelected = selectedLibraryName === previousName
     const nextLibraries = libraries.map((library) => library.id === id ? { ...library, name, icon: editingLibraryCover } : library)
@@ -1307,6 +1695,7 @@ export default function Knowledge() {
   }
 
   const deleteLibrary = (id: number) => {
+    if (sharedLibraries.some((library) => library.id === id)) return
     const nextLibraries = libraries.filter((library) => library.id !== id)
     const nextContents = { ...contentMap }
     const nextConversations = Object.fromEntries(Object.entries(conversationsByScope).filter(([key]) => key !== `library:${id}` && !key.startsWith(`folder:${id}:`)))
@@ -1321,9 +1710,27 @@ export default function Knowledge() {
     persistConversations(nextConversations)
   }
 
-  const createLibrary = () => {
+  // 打开「新建知识库」：重置一次性草稿并拉取共享对象候选。候选名单每次打开都重拉，新用户注册后能马上选到。
+  const openCreateLibrary = async (type: 'personal' | 'shared' | 'subscribed') => {
+    setCreatingLibraryType(type)
+    setNewLibraryName('')
+    setNewLibraryCover('neural')
+    setCreateSharePicked(new Set())
+    setCreateShareLevelId(null)
+    setCreateShareError(null)
+    setCreatingLibrary(true)
+    const result = await listShareCandidates()
+    if (result.success && result.data) {
+      setCreateShareCandidates(result.data.users)
+      setCreateShareOrgNodes(result.data.nodes || [])
+    }
+  }
+
+  const createLibrary = async () => {
     const name = newLibraryName.trim()
-    if (!name) return
+    if (!name || createShareBusy) return
+    const picked = [...createSharePicked]
+    const wantShare = picked.length > 0
     const id = ++idCounterRef.current
     const nextLibraries = [...libraries, { id, name, icon: newLibraryCover, description: '', count: 0, type: creatingLibraryType }]
     const nextContents = { ...contentMap, [id]: [] }
@@ -1331,16 +1738,47 @@ export default function Knowledge() {
     setContentMap(nextContents)
     setActiveId(id)
     setSelectedLibraryName(name)
+    setCreateShareError(null)
+    if (!wantShare) {
+      setCreatingLibrary(false)
+      persistWorkspace(nextLibraries, nextContents, getGroups(), name)
+      return
+    }
+    // 有共享对象：先落库拿到服务端真实 id（本地 id 只是乐观计数，PUT 后由后端重发），
+    // 再共享。全程保持弹窗并给出进度/错误，避免创建已成功但共享失败时用户看不到原因。
+    setCreateShareBusy(true)
+    const saved = await persistWorkspace(nextLibraries, nextContents, getGroups(), name)
+    if (!saved.success) { setCreateShareBusy(false); return }
+    const refreshed = await getKnowledgeWorkspace<KnowledgeWorkspace>()
+    const realId = refreshed.data?.libraries.find((library) => library.name === name)?.id
+    if (realId == null) {
+      setCreateShareBusy(false)
+      setCreateShareError('知识库已创建，但未能定位库 id，请稍后在「共享管理」中手动共享')
+      return
+    }
+    let failed: string | null = null
+    if (picked.length) {
+      const result = await createUserKnowledgeShares(realId, picked)
+      if (!result.success) failed = result.error || '共享失败'
+    }
+    if (failed) { setCreateShareBusy(false); setCreateShareError(failed); return }
+    await refreshShares()
+    setCreateShareBusy(false)
+    setCreateSharePicked(new Set())
     setCreatingLibrary(false)
-    setNewLibraryName('')
-    setNewLibraryCover('neural')
-    persistWorkspace(nextLibraries, nextContents, getGroups(), name)
   }
 
-  const addContent = () => {
-    const name = newContentName.trim()
+  const addContent = async () => {
+    const rawName = newContentName.trim()
     const libraryId = addingContentLibraryId
-    if (!name || libraryId == null) return
+    if (!rawName || libraryId == null || isSharedActive || addingContentBusy) return
+    const name = newContentType === 'doc'
+      ? (/\.docx$/i.test(rawName) ? rawName : `${rawName.replace(/\.doc$/i, '')}.docx`)
+      : newContentType === 'text'
+        ? (/\.txt$/i.test(rawName) ? rawName : `${rawName.replace(/\.(docx?|txt)$/i, '')}.txt`)
+        : newContentType === 'sheet'
+          ? (/\.xlsx$/i.test(rawName) ? rawName : `${rawName.replace(/\.(docx?|xlsx?|txt)$/i, '')}.xlsx`)
+      : rawName
     // 同级重名必须先拦掉，理由和重命名一样——但这里更狠：文件夹路径由名字拼成，两个同名的同级
     // 文件夹在系统里指向同一个 parent_path，看起来「都装着同一批内容」，删掉其中任何一个还会
     // 连带删掉另一个的子项。而且列表行的 key 也是「父路径-名字」，重名会让两行撞同一个 key。
@@ -1350,19 +1788,67 @@ export default function Knowledge() {
     const parent = currentFolder || null
     const duplicated = (contentMap[libraryId] || []).some((candidate) => (candidate.parent || null) === parent && candidate.name === name)
     if (duplicated) { setNewContentError('同一层级下已存在同名内容'); return }
-    const nextContents = {
-      ...contentMap,
-      [libraryId]: [...(contentMap[libraryId] || []), { id: createContentId(), name, type: newContentType, ...createContentTimestamps(), ...(newContentType === 'folder' ? { count: 0 } : {}), ...(parent ? { parent } : {}) }],
-    }
-    const nextLibraries = libraries.map((library) => library.id === libraryId ? { ...library, count: nextContents[libraryId].length } : library)
-    setContentMap(nextContents)
-    setLibraries(nextLibraries)
-    setActiveId(libraryId)
-    setAddingContentLibraryId(null)
-    setNewContentName('')
-    setNewContentType('folder')
+    setAddingContentBusy(true)
     setNewContentError(null)
-    persistWorkspace(nextLibraries, nextContents)
+    try {
+      const wordAsset = newContentType === 'doc'
+        ? await markdownToDocxBytes('')
+        : null
+      const textAsset = newContentType === 'text' ? new TextEncoder().encode('') : null
+      const excelAsset = newContentType === 'sheet'
+        ? buildExcelBytes([{
+          name: 'Sheet1',
+          data: Array.from({ length: 100 }, () => Array.from({ length: 26 }, () => null)),
+          columns: 26,
+          rows: 100,
+          columnWidths: Array.from({ length: 26 }, () => 120),
+          rowHeights: Array.from({ length: 100 }, () => 34),
+          merges: [],
+          startRow: 0,
+          startCol: 0,
+        }], 'xlsx')
+        : null
+      const item: ContentItem = {
+        id: createContentId(),
+        name,
+        type: newContentType === 'text' || newContentType === 'sheet' ? 'doc' : newContentType,
+        ...createContentTimestamps(),
+        ...(newContentType === 'folder' ? { count: 0 } : {}),
+        ...(wordAsset ? {
+          src: bytesToDataUrl(wordAsset, DOCX_MIME_TYPE),
+          mimeType: DOCX_MIME_TYPE,
+          size: wordAsset.length,
+        } : {}),
+        ...(textAsset ? {
+          src: bytesToDataUrl(textAsset, 'text/plain'),
+          mimeType: 'text/plain',
+          size: textAsset.length,
+        } : {}),
+        ...(excelAsset ? {
+          src: bytesToDataUrl(excelAsset.bytes, XLSX_MIME_TYPE),
+          mimeType: excelAsset.mimeType,
+          size: excelAsset.bytes.length,
+        } : {}),
+        ...(parent ? { parent } : {}),
+      }
+      const nextContents = {
+        ...contentMap,
+        [libraryId]: [...(contentMap[libraryId] || []), item],
+      }
+      const nextLibraries = libraries.map((library) => library.id === libraryId ? { ...library, count: nextContents[libraryId].length } : library)
+      setContentMap(nextContents)
+      setLibraries(nextLibraries)
+      setActiveId(libraryId)
+      setAddingContentLibraryId(null)
+      setNewContentName('')
+      setNewContentType('folder')
+      setNewContentError(null)
+      void persistWorkspace(nextLibraries, nextContents)
+    } catch (error) {
+      setNewContentError(error instanceof Error ? `无法创建文档：${error.message}` : '无法创建文档')
+    } finally {
+      setAddingContentBusy(false)
+    }
   }
 
   // 取消要把名字一并清掉：只关弹窗的话，下次打开输入框里还留着上次没提交的名字，
@@ -1428,12 +1914,14 @@ export default function Knowledge() {
   }
 
   const importLocalFiles = async (files: File[]) => {
+    if (isSharedActive) return
     const viewParent = currentFolder
     const importedFiles = await prepareImportedFiles(files, viewParent ?? undefined)
     await commitImportedContent(importedFiles, importedFiles.map((item) => item.id), viewParent)
   }
 
   const importLocalFolder = async (files: Array<File & { webkitRelativePath?: string }>) => {
+    if (isSharedActive) return
     const folderName = files[0]?.webkitRelativePath?.split('/')[0]
     if (!folderName) return
     const viewParent = currentFolder
@@ -1455,7 +1943,7 @@ export default function Knowledge() {
   }
 
   const addWebLink = () => {
-    if (activeId == null) return
+    if (activeId == null || isSharedActive) return
     const rawUrl = linkUrl.trim()
     if (!rawUrl) { setLinkError('请输入网页链接'); return }
     const parsed = parseWebLink(rawUrl)
@@ -1481,7 +1969,7 @@ export default function Knowledge() {
   }
 
   const deleteContent = (item: ContentItem) => {
-    if (activeId == null) return
+    if (activeId == null || isSharedActive) return
     const itemPath = item.parent ? `${item.parent}/${item.name}` : item.name
     const nextItems = (contentMap[activeId] || []).filter((candidate) => {
       if (candidate === item) return false
@@ -1538,6 +2026,8 @@ export default function Knowledge() {
   // 于是「连带走什么」从换路径前缀升级成换数组，问答记录、会话键、库条目数都要跟着改。
   const relocateContent = (item: ContentItem, nextName: string, nextParent: string | null, targetLibraryId = activeId, nextUrl?: string) => {
     if (activeId == null || targetLibraryId == null) return
+    // 共享库既不能当源也不能当目标（跨库移动会把别人的库塞进私有快照）。
+    if (isSharedActive || sharedLibraries.some((library) => library.id === targetLibraryId)) return
     const sourceId = activeId
     // 跨库时条目是「整条换库」，同库时只是换路径前缀；下面所有历史数据的搬运都按这个开关分叉。
     const crossesLibrary = targetLibraryId !== sourceId
@@ -1628,7 +2118,7 @@ export default function Knowledge() {
 
   const renameContent = () => {
     const item = renamingContent
-    if (!item || activeId == null) return
+    if (!item || activeId == null || isSharedActive) return
     const nextName = renameValue.trim()
     if (!nextName) { setRenamingContent(null); setRenameError(null); return }
     // 同级重名必须先拦掉：列表行的 React key 是「父路径-名字」，文件夹路径也由名字拼成，
@@ -1787,16 +2277,82 @@ export default function Knowledge() {
     persistConversations(nextConversations)
   }
 
-  const createKnowledgeCollection = () => {
-    const name = window.prompt('请输入知识库集合名称')?.trim()
-    if (!name) return
-    const key = `collection-${++idCounterRef.current}`
-    const nextCustoms = [...customCollections, key]
-    const nextTitles = { ...sectionTitles, [key]: name }
-    setCustomCollections(nextCustoms)
-    setSectionTitles(nextTitles)
-    setExpanded((states) => ({ ...states, [key]: true }))
-    persistWorkspace(libraries, contentMap, getGroups(nextTitles, nextCustoms))
+  // —— 共享知识库操作（全员 + 指定用户多选） ——
+  const refreshShares = async () => {
+    const sharesResult = await listKnowledgeShares()
+    if (!sharesResult.success || !sharesResult.data) return
+    // 每库聚合为授权数组（全员行 0 或 1 条 + 点名行 N 条）。徽标从这里实时派生，
+    // 不再往 libraries 上盖章 —— 盖章会被任何一次快照重载整份覆盖（切换选中库、
+    // 标签页回来静默刷新），就是"一点别的库徽标消失、刷新又回来"的根因。
+    const grouped = new Map<number, KnowledgeShareEntry[]>()
+    for (const entry of sharesResult.data.outgoing) {
+      const list = grouped.get(entry.libraryId)
+      if (list) list.push(entry)
+      else grouped.set(entry.libraryId, [entry])
+    }
+    setOutgoingByLibrary(grouped)
+  }
+
+  const openShareDialog = async (libraryId: number) => {
+    closeRowMenu()
+    setShareError(null)
+    setShareLevelId(null)
+    setSharePicked(new Set())
+    setShareDialogLibraryId(libraryId)
+    // 候选名单每次打开都重拉：新用户注册后要能马上选到，这份数据小到不值得缓存。
+    // 组织架构索引与候选同源，一次请求拿全（普通用户读不到管理员专属的 GET /org）。
+    const result = await listShareCandidates()
+    if (result.success && result.data) {
+      setShareCandidates(result.data.users)
+      setShareOrgNodes(result.data.nodes || [])
+    }
+  }
+
+  // 「保存共享」：弹窗语义是"把勾选集合提交上去"。点名授权走批量 POST，
+  // 已存在的授权后端静默跳过（不报 409）。撤销授权不在这里做 —— 逐行「撤销」按钮
+  // 各走 DELETE，新增与撤销两个动作分离，避免"提交完整集合"式 diff 的歧义。
+  //
+  // 「所有人可见」的开启入口已从界面上移除（新建弹窗里的勾选框一并去掉），
+  // 这里只剩下点名授权；存量全员授权仍可在弹窗里撤销。
+  const saveShareDialog = async () => {
+    if (shareDialogLibraryId == null || shareBusy) return
+    setShareBusy(true)
+    setShareError(null)
+    let failed: string | null = null
+    const pending = [...sharePicked]
+    if (pending.length) {
+      const result = await createUserKnowledgeShares(shareDialogLibraryId, pending)
+      if (!result.success) failed = result.error || '共享失败'
+    }
+    setShareBusy(false)
+    if (failed) { setShareError(failed); return }
+    await refreshShares()
+    // 弹窗不关闭、层级下拉保留 —— 用户往往要接着在同一个层级里挑下一个人。
+    setSharePicked(new Set())
+  }
+
+  // 撤销单条授权（弹窗内每行一个按钮；菜单快捷入口撤全员行）。
+  const revokeShareEntry = async (entry: KnowledgeShareEntry) => {
+    if (shareBusy) return
+    setShareBusy(true)
+    const result = await revokeKnowledgeShare(entry.shareId)
+    setShareBusy(false)
+    if (!result.success) { setShareError(result.error || '取消共享失败'); return }
+    await refreshShares()
+  }
+
+  // 徽标派生器：渲染时实时查授权表，库列表怎么被覆盖都不丢。
+  // title 只说「共享给了谁」，不缀「（只读）」：共享出去的一律只读是这个功能的固定前提，
+  // 每次悬停都重申一遍没有信息量。
+  const shareBadge = (libraryId: number): { label: string; title: string } | null => {
+    const entries = outgoingByLibrary.get(libraryId)
+    if (!entries?.length) return null
+    const everyone = entries.some((entry) => entry.granteeType === 'everyone')
+    const users = entries.filter((entry) => entry.granteeType === 'user')
+    if (everyone && users.length) return { label: '已共享', title: `已共享给所有人及 ${users.length} 位用户` }
+    if (everyone) return { label: '已共享·全员', title: '已共享给组织内全部用户' }
+    const names = users.slice(0, 3).map((entry) => entry.granteeName || `用户${entry.granteeUserId}`).join('、')
+    return { label: `已共享·${users.length}人`, title: `已共享给 ${names}${users.length > 3 ? ' 等' : ''}` }
   }
 
   const finishDrag = () => {
@@ -1825,6 +2381,7 @@ export default function Knowledge() {
 
   /** 同组内重排。只动顺序，其余字段一概不碰。 */
   const moveLibrary = (targetId: number, placeAfter: boolean) => {
+    if (dragPayload && sharedLibraries.some((library) => library.id === dragPayload.id)) return
     // 搜索过滤中列表只显示一部分行，「插到 X 前面」在完整数组里落不到用户以为的位置。
     // 手柄那边已经禁掉了，这里再兜一道——这个状态的输入是「哪些行可见」，不能只靠 UI 约定。
     if (libraryQuery) return
@@ -1853,12 +2410,54 @@ export default function Knowledge() {
     persistWorkspace(remaining, contentMap, getGroups(), null)
   }
 
-  const selectLibrary = async (library: Library) => {
+  // 共享库的读者侧重排。与 moveLibrary 刻意分开，因为两者写的是完全不同的东西：
+  // 那边重排的是**私有快照**（整份 PUT /workspace，会动 revision），这边只改本人侧栏的展示顺序
+  // （独立端点），一个字节都不写 owner 的数据。
+  const persistSharedOrder = async (nextShared: SharedLibrary[]) => {
+    const version = ++sharedOrderVersionRef.current
+    setSyncState('saving')
+    const saved = await saveSharedLibraryOrder(nextShared.map((library) => library.id))
+    if (version !== sharedOrderVersionRef.current) return
+    // 失败**不回滚**本地顺序：persistWorkspace 失败时也不回滚（见那里的注释），两处行为应当一致。
+    // 而且顺序是纯展示偏好，把刚拖好的行弹回去只会更像坏了；刷新后自然回到服务端的真实顺序。
+    setSyncState(saved.success ? 'saved' : 'error')
+    if (saved.success) {
+      window.setTimeout(() => { if (version === sharedOrderVersionRef.current) setSyncState('idle') }, 1600)
+    }
+  }
+
+  /** 共享分区内重排。跨分区一律不接 —— 归属由授权决定，不由本地顺序决定。 */
+  const moveSharedLibrary = (targetId: number, placeAfter: boolean) => {
+    if (!dragPayload) return
+    // 两条都要查：section 区分"从哪个分区拖出来的"，membership 才是权威。
+    // 只看 section 字符串会误判 —— knowledge_library.library_type 的枚举里也有 'shared'，
+    // 一个 type='shared' 的**自有**库拖起来 section 同样是 'shared'，但它不在 sharedLibraries 里。
+    if (dragPayload.section !== SHARED_SECTION) return
+    if (!sharedLibraries.some((library) => library.id === dragPayload.id)) return
+    // 搜索过滤中列表只显示一部分行 —— 与 moveLibrary 同一条理由，不能只靠 UI 约定禁用。
+    if (libraryQuery) return
+    if (dragPayload.id === targetId) return
+    const source = sharedLibraries.find((library) => library.id === dragPayload.id)
+    if (!source) return
+    const remaining = sharedLibraries.filter((library) => library.id !== dragPayload.id)
+    const targetIndex = remaining.findIndex((library) => library.id === targetId)
+    if (targetIndex < 0) return
+    remaining.splice(targetIndex + (placeAfter ? 1 : 0), 0, source)
+    // 原地落下等于没动。这里直接按下标比就行 —— 共享库是一个平铺列表，
+    // 不像 libraries 那样按 type 交错了多个分区（那边得先按分区投影再比）。
+    if (sharedLibraries.every((library, index) => library.id === remaining[index].id)) return
+    setSharedLibraries(remaining)
+    void persistSharedOrder(remaining)
+  }
+
+  const selectLibrary = async (library: Library | SharedLibrary) => {
     setActiveId(library.id)
     setSelectedLibraryName(library.name)
     setSelectedCollectionKey(null)
     setCurrentFolder(null)
     setSelectedDocument(null)
+    // 共享库的内容已在只读快照里，不必也不应再按私有工作区回读覆盖。
+    if ((library as SharedLibrary).permission === 'read') return
     const result = await getKnowledgeWorkspace<KnowledgeWorkspace>()
     if (!result.success || !result.data) return
     const data = result.data
@@ -1884,6 +2483,26 @@ export default function Knowledge() {
           setExpanded((states) => ({ ...states, ...Object.fromEntries(data.groups!.map((group) => [group.key, states[group.key] ?? false])) }))
         }
       }
+      // 共享库（全员 + 指定用户只读）：与私有快照并行拉取；失败静默降级成空分区，不打断主流程。
+      void (async () => {
+        const [sharedResult, sharesResult] = await Promise.all([getSharedKnowledgeWorkspace(), listKnowledgeShares()])
+        if (cancelled) return
+        if (sharedResult.success && sharedResult.data) {
+          setSharedLibraries(sharedResult.data.libraries as SharedLibrary[])
+          setSharedContents(sharedResult.data.contents as Record<number, ContentItem[]>)
+        }
+        if (sharesResult.success && sharesResult.data) {
+          // 只存授权关系，徽标渲染时实时查（shareBadge）。**不再往 libraries 上盖章**：
+          // 盖章会被 selectLibrary 的快照重载整份覆盖，就是徽标"点一下别的库就没了"的根因。
+          const grouped = new Map<number, KnowledgeShareEntry[]>()
+          for (const entry of sharesResult.data.outgoing) {
+            const list = grouped.get(entry.libraryId)
+            if (list) list.push(entry)
+            else grouped.set(entry.libraryId, [entry])
+          }
+          setOutgoingByLibrary(grouped)
+        }
+      })()
       // 问答记录：优先来自后端；后端为空/未实现时迁移 workspace 中的历史会话
       const conv = await getKnowledgeConversations()
       const serverMap = conv.success && conv.data ? conv.data : {}
@@ -2037,7 +2656,7 @@ export default function Knowledge() {
           ? { level: 'folder', libraryId: scope.libraryId, folder: scope.folder }
           : undefined
     const history = current ? (editingIndex === null ? current.messages : current.messages.slice(0, editingIndex)) : []
-    const result = await askKnowledge(libraryId, text, history, controller.signal, askScope)
+    const result = await askKnowledge(libraryId, text, history, controller.signal, askScope, webSearch)
     if (controller.signal.aborted) return
     const answer = result.success && result.data ? result.data.answer : `问答失败：${result.error || '未知错误'}`
     const citations = result.success && result.data ? result.data.citations : []
@@ -2125,17 +2744,21 @@ export default function Knowledge() {
       name: item.name,
       type: item.type,
       updatedAt: item.updatedAt,
-      library: active?.name || selectedLibraryName || '知识库',
+      library: activeName || selectedLibraryName || '知识库',
       libraryId: String(activeId || ''),
       ...(item.mimeType ? { mimeType: item.mimeType } : {}),
       ...(item.size != null ? { size: String(item.size) } : {}),
       ...(item.parent ? { parent: item.parent } : {}),
+      ...(isSharedActive ? { readonly: '1' } : {}),
     })
     return `${import.meta.env.BASE_URL}knowledge/document?${params.toString()}`
   }
 
   const section = (key: string, title: string, children?: React.ReactNode, onAdd?: () => void) => {
     const menuOpen = openMenuId === sectionMenuKey(key)
+    // 系统分区（个人/共享/订阅）不可重命名、不可删除，仅自定义集合有这两个入口。
+    const isCustom = customCollections.includes(key)
+    const hasMenu = Boolean(onAdd) || isCustom
     return <div className="border-b border-base-200 py-2">
       {/* 悬停高亮挂在外层整行上，不挂在标题按钮上：挂在按钮上时高亮在「⋯」前面就断了，
           鼠标移到「⋯」上整行反而没反应。知识库行一直是整行高亮，这里对齐它。 */}
@@ -2147,14 +2770,89 @@ export default function Knowledge() {
         {/* 这一行原先是并排三个 hover 按钮（+ / 改名 / 删库），是页面上唯一没走「⋯」的地方：
             尺寸是 DaisyUI 的 24px、图标各画各的，旁边的知识库行却是 32px 的「⋯」。收进同一个菜单后
             图标、尺寸、显隐规则全部一致，代价是「添加知识库」多一次点击。 */}
-        <div className="mr-1"><RowMenuTrigger open={menuOpen} onClick={(event) => toggleRowMenu(sectionMenuKey(key), event.currentTarget)} label={`${title}操作`} /></div>
+        {hasMenu ? <div className="mr-1"><RowMenuTrigger open={menuOpen} onClick={(event) => toggleRowMenu(sectionMenuKey(key), event.currentTarget)} label={`${title}操作`} /></div> : null}
       </div>
       {expanded[key] && children}
       {menuOpen && menuAnchor ? <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef}>
-        <MenuAction icon={menuIcons.folderPlus} label="添加知识库" onClick={() => { closeRowMenu(); onAdd?.() }} />
-        <MenuAction icon={menuIcons.edit} label="重命名分组" onClick={() => { closeRowMenu(); renameSection(key) }} />
-        <MenuAction icon={menuIcons.trash} label="删除分组" tone="danger" onClick={() => { closeRowMenu(); deleteSectionLibraries(key) }} />
+        {onAdd ? <MenuAction icon={menuIcons.folderPlus} label="添加知识库" onClick={() => { closeRowMenu(); onAdd() }} /> : null}
+        {isCustom ? <MenuAction icon={menuIcons.edit} label="重命名分组" onClick={() => { closeRowMenu(); renameSection(key) }} /> : null}
+        {isCustom ? <MenuAction icon={menuIcons.trash} label="删除分组" tone="danger" onClick={() => { closeRowMenu(); deleteSectionLibraries(key) }} /> : null}
       </RowMenuPopover> : null}
+    </div>
+  }
+
+  // 收到的共享库列表（只读）：无新建/改名/删除入口，点开即可浏览与问答。
+  // 唯一可写的是**顺序** —— 那是读者自己的展示偏好，存服务端（PUT /knowledge/shared/order），
+  // 不写 owner 的任何数据。跨分区拖拽不接（见 moveSharedLibrary）。
+  const renderSharedLibraryList = () => {
+    const needle = libraryQuery.toLowerCase()
+    const items = sharedLibraries.filter((library) => `${library.name}${library.description}`.toLowerCase().includes(needle))
+    // 与 renderLibraryList 同一条判据：搜索过滤中列表只显示一部分行，"插到 X 前面"落不到
+    // 用户以为的位置，所以直接禁掉手柄。
+    const dragEnabled = !libraryQuery
+    return <div className="space-y-1 px-1 pb-1">
+      {items.map((library) => {
+        const isDragged = dragPayload?.id === library.id
+        // 只接共享分区内部。拖进来的必须是共享库（membership 是权威判定，不看 section 字符串），
+        // 落点也必须在共享分区（这一整个列表就是共享分区，所以只需校验来源）。
+        const accepts = dragEnabled && dragPayload !== null
+          && dragPayload.section === SHARED_SECTION
+          && dragPayload.id !== library.id
+          && sharedLibraries.some((entry) => entry.id === dragPayload.id)
+        const zone = dropTarget?.id === library.id ? dropTarget.zone : null
+        return <div
+          key={library.id}
+          className={`group relative flex flex-col rounded-lg transition-all ${selectedLibraryName === library.name ? 'bg-primary/10 ring-1 ring-primary/30' : 'hover:bg-base-200/70'} ${isDragged ? 'opacity-40' : ''}`}
+          aria-selected={selectedLibraryName === library.name}
+          onDragOver={accepts ? (event) => {
+            event.preventDefault()
+            const next = zoneAtDrop(event)
+            // 恒等短路同 renderLibraryList：每帧新对象会让 Object.is 永不相等，整页跟着鼠标 60fps 重渲染。
+            setDropTarget((current) => current?.id === library.id && current.zone === next ? current : { id: library.id, zone: next })
+          } : undefined}
+          onDrop={accepts ? (event) => {
+            event.preventDefault()
+            // 这一行在 drop 事件里跑，不在渲染期；moveSharedLibrary 只是经由 persistSharedOrder
+            // 读了一个"最后一次保存序号"的 ref。react-hooks/refs 追不过「箭头是不是事件处理器」这层，
+            // 只要能从渲染期的 renderSharedLibraryList 追到 ref 访问就报 —— 误报（浏览器实测：
+            // 拖动时只发一次 PUT，渲染期不发任何请求）。
+            // eslint-disable-next-line react-hooks/refs -- onDrop 里调用，ref 只在事件期访问
+            moveSharedLibrary(library.id, zoneAtDrop(event) === 'after')
+            finishDrag()
+          } : undefined}
+        >
+          {/* 落点细条绝对定位，理由同 renderLibraryList：border-t-2 会撑高行、让 zoneAtDrop 量到的
+              中线跟着漂，光标卡在边界上就会「亮→灭→亮」来回翻。 */}
+          {zone === 'before' && <span className="pointer-events-none absolute inset-x-1 -top-0.5 h-0.5 rounded-full bg-primary" />}
+          {zone === 'after' && <span className="pointer-events-none absolute inset-x-1 -bottom-0.5 h-0.5 rounded-full bg-primary" />}
+          <div className="flex h-10 items-center">
+            <span
+              className={`shrink-0 select-none pl-1 text-base-content/25 ${dragEnabled ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed opacity-30'}`}
+              draggable={dragEnabled}
+              title={dragEnabled ? '拖动排序' : '搜索时无法排序'}
+              onDragStart={(event) => {
+                if (!dragEnabled) return
+                event.stopPropagation()
+                event.dataTransfer.effectAllowed = 'move'
+                // 真实拖拽里 useRowMenu 的 document pointerdown 监听总是先于 dragstart 触发，菜单
+                // 早就关了；这行是给派发合成 DragEvent 的 QA 脚本兜底的，那里没有 pointerdown。
+                closeRowMenu()
+                setDragPayload({ id: library.id, section: SHARED_SECTION })
+              }}
+              onDragEnd={finishDrag}
+            >⠿</span>
+            <button onClick={() => { void selectLibrary(library) }} className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg px-3 text-left text-sm text-base-content/70 transition">
+              <LibraryCover cover={library.icon} className="h-6 w-6 shrink-0" />
+              <span className="truncate">{library.name}</span>
+              {/* 只标「来自谁」。「· 只读」不写在这里：整个共享分区本来就是只读的，
+                  每行都缀一遍等于把分区属性重复 N 次；真需要提示时由被选中的共享库那条路径
+                  （禁止新增内容的按钮 title）承担。 */}
+              <span className="shrink-0 rounded bg-base-200 px-1.5 py-0.5 text-[10px] text-base-content/45" title={`来自 ${library.ownerName}`}>{library.ownerName}</span>
+            </button>
+          </div>
+        </div>
+      })}
+      {!items.length && <p className="px-3 py-3 text-xs text-base-content/35">{sharedLibraries.length ? '没有匹配的知识库' : '暂无共享知识库'}</p>}
     </div>
   }
 
@@ -2182,6 +2880,9 @@ export default function Knowledge() {
           } : undefined}
           onDrop={accepts ? (event) => {
             event.preventDefault()
+            // 同 renderSharedLibraryList 那一处：在 drop 事件里跑，ref 只经 persistWorkspace 的
+            // "最后一次保存序号"被读到，渲染期不访问。react-hooks/refs 的误报，理由见那里的注释。
+            // eslint-disable-next-line react-hooks/refs -- onDrop 里调用，ref 只在事件期访问
             moveLibrary(library.id, zoneAtDrop(event) === 'after')
             finishDrag()
           } : undefined}
@@ -2216,11 +2917,13 @@ export default function Knowledge() {
             <button onClick={() => { void selectLibrary(library) }} className="flex h-10 min-w-0 flex-1 items-center gap-2 rounded-lg px-3 text-left text-sm text-base-content/70 transition">
               <LibraryCover cover={library.icon} className="h-6 w-6 shrink-0" />
               <span className="truncate">{library.name}</span>
+              {(() => { const badge = shareBadge(library.id); return badge ? <span className="shrink-0 rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700" title={badge.title}>{badge.label}</span> : null })()}
             </button>
             <div className="mr-1"><RowMenuTrigger open={menuOpen} onClick={(event) => toggleRowMenu(libraryMenuKey(library.id), event.currentTarget)} label={`${library.name}操作`} /></div>
           </div>
           {menuOpen && menuAnchor ? <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef}>
             <MenuAction icon={menuIcons.edit} label="修改资料" onClick={() => { closeRowMenu(); setEditingLibraryId(library.id); setEditingLibraryName(library.name); setEditingLibraryCover(library.icon || 'neural') }} />
+            <MenuAction icon={menuIcons.link} label="共享管理" onClick={() => { void openShareDialog(library.id) }} />
             <MenuAction icon={menuIcons.trash} label="删除" tone="danger" onClick={() => { closeRowMenu(); setDeletingLibraryId(library.id) }} />
           </RowMenuPopover> : null}
         </div>
@@ -2239,20 +2942,21 @@ export default function Knowledge() {
       <div ref={workspaceRef} className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-base-200 bg-base-100 shadow-sm">
       <aside style={{ width: leftWidth }} className="flex shrink-0 flex-col bg-base-100">
         <div className="flex h-14 items-center justify-between border-b border-base-200 px-4">
-          <span className={`whitespace-nowrap text-sm font-medium text-base-content/70 transition-all duration-200 ${librarySearchOpen ? 'w-0 overflow-hidden opacity-0' : 'w-auto opacity-100'}`}>我的知识库</span>
+          {/* 字重和颜色都向 API 测试页的「接口信息」标题（h2，font-semibold + 默认色）看齐：
+              两页左栏顶上是同一种东西，一边 600 一边 500、一边实色一边 70% 透明，并排看就是
+              「这边没加粗、还发灰」。去掉 /70 只是回到默认色，顺带也跟下面 个人/共享/订阅
+              三个分区标题（text-sm font-medium、默认色）齐了 —— 原先面板标题比它自己的分区标题还淡。 */}
+          <span className={`whitespace-nowrap text-sm font-semibold transition-all duration-200 ${librarySearchOpen ? 'w-0 overflow-hidden opacity-0' : 'w-auto opacity-100'}`}>我的知识库</span>
           <div className={`ml-auto flex h-9 items-center overflow-hidden rounded-lg transition-all duration-200 ${librarySearchOpen ? 'w-full border border-base-300 bg-base-100 shadow-sm' : 'w-9'}`}>
             {librarySearchOpen && <AutofocusInput value={libraryQuery} onChange={(event) => setLibraryQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') { setLibrarySearchOpen(false); setLibraryQuery('') } }} className="min-w-0 flex-1 bg-transparent pl-3 text-sm outline-none" placeholder="搜索知识库" />}
             <button onClick={() => { if (librarySearchOpen) setLibraryQuery(''); setLibrarySearchOpen((open) => !open) }} className="flex h-9 w-9 shrink-0 items-center justify-center text-base-content/55 hover:bg-base-200" aria-label={librarySearchOpen ? '关闭知识库搜索' : '搜索知识库'}><Icon>{librarySearchOpen ? <><path d="M18 6 6 18M6 6l12 12" /></> : <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>}</Icon></button>
           </div>
         </div>
         <div className="flex-1 overflow-y-auto px-1">
-          {section('personal', sectionTitles.personal, renderLibraryList('personal'), () => { setCreatingLibraryType('personal'); setCreatingLibrary(true) })}
-          {section('shared', sectionTitles.shared, renderLibraryList('shared'), () => { setCreatingLibraryType('shared'); setCreatingLibrary(true) })}
-          {section('subscribed', sectionTitles.subscribed, renderLibraryList('subscribed'), () => { setCreatingLibraryType('subscribed'); setCreatingLibrary(true) })}
-          {customCollections.map((key) => section(key, sectionTitles[key], <p className="px-5 pb-3 text-xs text-base-content/35">暂无知识库</p>, () => { setCreatingLibraryType('personal'); setCreatingLibrary(true) }))}
-        </div>
-        <div className="p-3">
-          <button type="button" className="btn btn-ghost btn-block" onClick={createKnowledgeCollection} title="新建知识库集合">+ 新建知识库集合</button>
+          {section('personal', sectionTitles.personal, renderLibraryList('personal'), () => { void openCreateLibrary('personal') })}
+          {section('shared', sectionTitles.shared, renderSharedLibraryList())}
+          {section('subscribed', sectionTitles.subscribed, renderLibraryList('subscribed'), () => { void openCreateLibrary('subscribed') })}
+          {customCollections.map((key) => section(key, sectionTitles[key], <p className="px-5 pb-3 text-xs text-base-content/35">暂无知识库</p>, () => { void openCreateLibrary('personal') }))}
         </div>
       </aside>
 
@@ -2263,7 +2967,7 @@ export default function Knowledge() {
           {currentFolder && <button onClick={() => setCurrentFolder(currentFolder.includes('/') ? currentFolder.slice(0, currentFolder.lastIndexOf('/')) : null)} className="rounded-lg p-2 text-base-content/55 hover:bg-base-200" title="返回上一级"><Icon><path d="m15 18-6-6 6-6" /></Icon></button>}
           <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg bg-base-200/70 px-3 text-base-content/35"><Icon><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></Icon><input disabled={!active} value={query} onChange={(e) => setQuery(e.target.value)} className="w-full bg-transparent text-sm text-base-content outline-none disabled:cursor-not-allowed" placeholder={active ? '搜索内容' : '请先选择知识库'} /></label>
           <div ref={sortPopoverRef} className="relative shrink-0">
-            <button disabled={!active} onClick={() => { setSortOpen((open) => !open); setAddMenuOpen(false) }} className={`rounded-lg p-2 text-base-content/45 hover:bg-base-200 disabled:cursor-not-allowed disabled:opacity-30 ${sortOpen ? 'bg-base-200 text-base-content' : ''}`} title="排序"><Icon><path d="M8 6h12M8 12h8M8 18h4" /><path d="M4 4v16m0 0-2-2m2 2 2-2" /></Icon></button>
+            <button disabled={!active || isSharedActive} onClick={() => { setSortOpen((open) => !open); setAddMenuOpen(false) }} className={`rounded-lg p-2 text-base-content/45 hover:bg-base-200 disabled:cursor-not-allowed disabled:opacity-30 ${sortOpen ? 'bg-base-200 text-base-content' : ''}`} title="排序"><Icon><path d="M8 6h12M8 12h8M8 18h4" /><path d="M4 4v16m0 0-2-2m2 2 2-2" /></Icon></button>
             {sortOpen && <div className="absolute right-0 top-[calc(100%+6px)] z-50">
               <MenuPanel>
                 {([['updated', '更新时间'], ['created', '创建时间'], ['size', '大小'], ['type', '类型'], ['name', '名称']] as const).map(([key, label]) => (
@@ -2273,7 +2977,7 @@ export default function Knowledge() {
             </div>}
           </div>
           <div ref={addPopoverRef} className="relative shrink-0">
-            <button disabled={!active} onClick={() => { setAddMenuOpen((open) => !open); setSortOpen(false) }} className={`rounded-lg p-2 text-base-content/45 hover:bg-base-200 disabled:cursor-not-allowed disabled:opacity-30 ${addMenuOpen ? 'bg-base-200 text-base-content' : ''}`} title="添加内容"><Icon><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><path d="M14 2v6h6M12 12v6m-3-3h6" /></Icon></button>
+            <button disabled={!active || isSharedActive} onClick={() => { setAddMenuOpen((open) => !open); setSortOpen(false) }} className={`rounded-lg p-2 text-base-content/45 hover:bg-base-200 disabled:cursor-not-allowed disabled:opacity-30 ${addMenuOpen ? 'bg-base-200 text-base-content' : ''}`} title={isSharedActive ? '共享知识库为只读' : '添加内容'}><Icon><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" /><path d="M14 2v6h6M12 12v6m-3-3h6" /></Icon></button>
             {addMenuOpen && <div className="absolute right-0 top-[calc(100%+6px)] z-50">
               <MenuPanel>
                 <MenuAction icon={menuIcons.uploadFile} label="本地文件" onClick={() => { setAddMenuOpen(false); fileInputRef.current?.click() }} />
@@ -2317,7 +3021,7 @@ export default function Knowledge() {
                   : <a href={item.url || getDocumentTabUrl(item)} target="_blank" rel="noopener noreferrer" className="flex min-w-0 flex-1 items-center gap-3 px-2.5 py-3 text-left">{content}</a>}
                 {/* 「⋯」触发器。菜单展开时保持可见，否则鼠标移开行、菜单还开着却找不到它的入口。
                     focus 让键盘 Tab 也能把触发器显出来，不然焦点会落在看不见的按钮上。 */}
-                <div className="mr-2"><RowMenuTrigger open={menuOpen} onClick={(event) => toggleRowMenu(item.id, event.currentTarget)} label="更多操作" /></div>
+                {!isSharedActive && <div className="mr-2"><RowMenuTrigger open={menuOpen} onClick={(event) => toggleRowMenu(item.id, event.currentTarget)} label="更多操作" /></div>}
               </div>
               {menuOpen && menuAnchor ? <RowMenuPopover anchor={menuAnchor} panelRef={rowMenuRef}>
                 <MenuAction icon={menuIcons.edit} label={item.url ? '编辑' : '重命名'} onClick={() => openRenameContent(item)} />
@@ -2343,21 +3047,16 @@ export default function Knowledge() {
             <DocumentTypeBadge item={selectedDocument} size="sm" />
             <div className="min-w-0 flex-1"><h2 className="truncate text-sm font-medium">{selectedDocument.name}</h2><p className="mt-0.5 text-[11px] text-base-content/35">{formatContentUpdatedAt(selectedDocument.updatedAt)}</p></div>
             <button onClick={() => setDocumentAssistantOpen((open) => !open)} className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs hover:bg-base-200 ${documentAssistantOpen ? 'bg-emerald-50 text-emerald-600' : 'text-base-content/45'}`} title="知识助手"><span className="flex h-5 w-5 items-center justify-center rounded-md bg-linear-to-br from-lime-300 to-emerald-400 text-[9px] font-bold text-emerald-950">AI</span><span className="hidden sm:inline">助手</span></button>
-            <button className="rounded-lg p-2 text-base-content/45 hover:bg-base-200" title="下载文档"><Icon><path d="M12 3v12m-4-4 4 4 4-4" /><path d="M5 21h14" /></Icon></button>
+            <button onClick={() => void downloadContent(selectedDocument)} disabled={!selectedDocument.hasAsset && !selectedDocument.src} className="rounded-lg p-2 text-base-content/45 transition hover:bg-base-200 disabled:opacity-30" title="下载文档" aria-label="下载文档"><Icon><path d="M12 3v12m-4-4 4 4 4-4" /><path d="M5 21h14" /></Icon></button>
             <button onClick={() => setSelectedDocument(null)} className="rounded-lg p-2 text-base-content/45 hover:bg-base-200" title="关闭文档"><Icon><path d="M18 6 6 18M6 6l12 12" /></Icon></button>
           </div>
           <div className="flex h-10 shrink-0 items-center justify-between border-b border-base-200 bg-base-100 px-4 text-xs text-base-content/45">
             <span>文档预览</span>
-            {getDocumentKind(selectedDocument) === 'pdf' ? <span>使用 PDF 工具栏缩放、翻页和搜索</span> : <div className="flex items-center gap-1">
-              <button onClick={() => setPreviewZoom((value) => Math.max(70, value - 10))} disabled={previewZoom <= 70} className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-base-200 disabled:opacity-30" title="缩小">−</button>
-              <span className="w-12 text-center tabular-nums">{previewZoom}%</span>
-              <button onClick={() => setPreviewZoom((value) => Math.min(140, value + 10))} disabled={previewZoom >= 140} className="flex h-7 w-7 items-center justify-center rounded-md hover:bg-base-200 disabled:opacity-30" title="放大">＋</button>
-              <button onClick={() => setPreviewZoom(100)} className="ml-1 rounded-md px-2 py-1.5 hover:bg-base-200">适应页面</button>
-            </div>}
+            {getDocumentKind(selectedDocument) === 'pdf' ? <span>使用 PDF 工具栏缩放、翻页和搜索</span> : null}
             <span>{getDocumentKind(selectedDocument) === 'pdf' ? 'PDF 预览' : getDocumentKind(selectedDocument) === 'sheet' ? `工作表 ${previewSheetIndex + 1} / ${Math.max(getWorkbookSheetPreviews(selectedDocument).length, 1)}` : getDocumentKind(selectedDocument) === 'markdown' ? 'Markdown 预览' : getDocumentPagePreviews(selectedDocument).length > 0 ? `共 ${getDocumentPagePreviews(selectedDocument).length} 页` : '第 1 / 1 页'}</span>
           </div>
-          <div className="flex-1 overflow-auto bg-base-200/50 px-6 py-8">
-            <DocumentPreviewCanvas item={selectedDocument} zoom={previewZoom} sheetIndex={previewSheetIndex} onSheetChange={setPreviewSheetIndex} />
+          <div className="min-h-0 flex-1 overflow-auto bg-base-200/50 px-6 py-8">
+            <DocumentPreviewCanvas item={selectedDocument} sheetIndex={previewSheetIndex} onSheetChange={setPreviewSheetIndex} />
           </div>
           </section>
           {documentAssistantOpen ? <AssistantResizeHandle onPointerDown={startDocumentAssistantResize} className="hidden 2xl:flex" /> : null}
@@ -2377,7 +3076,7 @@ export default function Knowledge() {
                   <button onClick={() => { viewConversation(conversation.id); setHistoryOpen(false) }} className="min-w-0 flex-1 text-left"><div className={`truncate text-sm ${conversation.id === activeConversation?.id ? 'font-medium text-primary' : 'text-base-content/75'}`}>{conversation.title}</div><div className="mt-0.5 text-[10px] text-base-content/35">{formatConversationTime(conversation.updatedAt)}</div></button>
                   <button onClick={() => deleteConversation(conversation.id)} className="rounded-md p-1.5 text-base-content/30 opacity-0 hover:bg-error/10 hover:text-error group-hover/history:opacity-100" title="删除对话" aria-label="删除对话"><Icon className="h-3.5 w-3.5"><path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M8 6V4h8v2" /></Icon></button>
                 </li>)}</ul>}
-              </div> : !messages.length ? <p className="text-sm leading-6 text-base-content/70">你好，我是你的智能助手，能帮你快速读文章、答疑解惑，快向我提问吧！</p> : <div className="space-y-4">{messages.map((message, index) => <MessageBubble key={`${message.role}-${index}`} message={message} index={index} onEdit={asking ? undefined : (currentMessage, currentIndex) => { setQuestion(currentMessage.text); setEditingMessageIndex(currentIndex); setEditingConversationId(activeConversation?.id ?? null) }} isEditing={editingActive && editingMessageIndex === index} editValue={question} onEditChange={setQuestion} onCancelEdit={() => { setEditingMessageIndex(null); setEditingConversationId(null); setQuestion('') }} onSubmitEdit={() => { void ask() }} />)}<div ref={messagesEndRef} /></div>}
+              </div> : !messages.length ? <p className="text-sm leading-6 text-base-content/70">你好，我是你的智能助手，能帮你快速读文章、答疑解惑，快向我提问吧！</p> : <div className="space-y-4">{messages.map((message, index) => <MessageBubble key={`${message.role}-${index}`} message={message} index={index} onEdit={asking ? undefined : (currentMessage, currentIndex) => { setQuestion(currentMessage.text); setEditingMessageIndex(currentIndex); setEditingConversationId(activeConversation?.id ?? null) }} isEditing={editingActive && editingMessageIndex === index} editValue={question} onEditChange={setQuestion} onCancelEdit={() => { setEditingMessageIndex(null); setEditingConversationId(null); setQuestion('') }} onSubmitEdit={() => { void ask() }} onTestEndpoint={(endpoint) => openInApiTest(endpoint, message, index)} />)}<div ref={messagesEndRef} /></div>}
             </div>
             <div className="shrink-0 bg-base-100 px-4 pb-4 pt-0">
               {asking ? <div className="mb-2 flex items-center justify-between rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700"><span>正在生成回答…</span><button type="button" onClick={stopGeneration} className="rounded-md bg-white px-2 py-1 font-medium">停止</button></div> : null}
@@ -2429,15 +3128,15 @@ export default function Knowledge() {
             <p className="mt-2 max-w-sm text-sm leading-6 text-base-content/40">请先向「{sectionTitles[activeScope.key] || '该集合'}」中添加知识库，再基于集合提问</p>
           </div> : !messages.length ? <div className="flex h-full min-h-80 flex-col items-center justify-center text-center">
             <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-50 text-emerald-500"><Icon className="h-6 w-6"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z" /><path d="M8 9h8M8 13h5" /></Icon></div>
-            {activeScope.level === 'folder' ? <><h3 className="mt-4 font-medium">基于文件夹问答</h3><p className="mt-2 max-w-sm text-sm leading-6 text-base-content/40">向我提问，我会从「{active?.name || ''} / {activeScope.folder}」中查找信息并整理答案</p></> : activeScope.level === 'collection' ? <><h3 className="mt-4 font-medium">基于知识库集合问答</h3><p className="mt-2 max-w-sm text-sm leading-6 text-base-content/40">向我提问，我会从「{sectionTitles[activeScope.key] || '该集合'}」中的全部知识库查找信息并整理答案</p></> : <><h3 className="mt-4 font-medium">基于知识库问答</h3><p className="mt-2 max-w-sm text-sm leading-6 text-base-content/40">向我提问，我会从「{active?.name || ''}」中查找信息并整理答案</p></>}
+            {activeScope.level === 'folder' ? <><h3 className="mt-4 font-medium">基于文件夹问答</h3><p className="mt-2 max-w-sm text-sm leading-6 text-base-content/40">向我提问，我会从「{activeName} / {activeScope.folder}」中查找信息并整理答案</p></> : activeScope.level === 'collection' ? <><h3 className="mt-4 font-medium">基于知识库集合问答</h3><p className="mt-2 max-w-sm text-sm leading-6 text-base-content/40">向我提问，我会从「{sectionTitles[activeScope.key] || '该集合'}」中的全部知识库查找信息并整理答案</p></> : <><h3 className="mt-4 font-medium">基于知识库问答</h3><p className="mt-2 max-w-sm text-sm leading-6 text-base-content/40">向我提问，我会从「{activeName}」中查找信息并整理答案</p></>}
             <div className="mt-6 grid max-w-xl gap-2 sm:grid-cols-2">{(activeScope.level === 'collection' ? ['总结这个集合的主要内容', '集合中有哪些最近更新的资料？', '帮我汇总各知识库的产品需求', '根据集合内资料生成一份摘要'] : activeScope.level === 'folder' ? ['总结这个文件夹中的文档', '文件夹中有哪些资料？', '帮我查找相关需求文档', '根据文件夹内容生成摘要'] : ['总结这个知识库的主要内容', '有哪些最近更新的资料？', '帮我查找相关产品需求', '根据资料生成一份摘要']).map((prompt) => <button key={prompt} onClick={() => setQuestion(prompt)} className="rounded-xl border border-base-200 px-4 py-3 text-left text-xs text-base-content/55 hover:border-primary/25 hover:bg-primary/5 hover:text-primary">{prompt}</button>)}</div>
-          </div> : <div className="mx-auto max-w-4xl space-y-5">{messages.map((message, index) => <MessageBubble key={`${message.role}-${index}`} message={message} bubbleClass="max-w-full px-0 py-1" index={index} onEdit={asking ? undefined : (currentMessage, currentIndex) => { setQuestion(currentMessage.text); setEditingMessageIndex(currentIndex); setEditingConversationId(activeConversation?.id ?? null) }} isEditing={editingActive && editingMessageIndex === index} editValue={question} onEditChange={setQuestion} onCancelEdit={() => { setEditingMessageIndex(null); setEditingConversationId(null); setQuestion('') }} onSubmitEdit={() => { void ask() }} />)}<div ref={messagesEndRef} /></div>}
+          </div> : <div className="mx-auto max-w-4xl space-y-5">{messages.map((message, index) => <MessageBubble key={`${message.role}-${index}`} message={message} bubbleClass="max-w-full px-0 py-1" index={index} onTestEndpoint={(endpoint) => openInApiTest(endpoint, message, index)} onEdit={asking ? undefined : (currentMessage, currentIndex) => { setQuestion(currentMessage.text); setEditingMessageIndex(currentIndex); setEditingConversationId(activeConversation?.id ?? null) }} isEditing={editingActive && editingMessageIndex === index} editValue={question} onEditChange={setQuestion} onCancelEdit={() => { setEditingMessageIndex(null); setEditingConversationId(null); setQuestion('') }} onSubmitEdit={() => { void ask() }} />)}<div ref={messagesEndRef} /></div>}
             </div>
             <div className="shrink-0 bg-base-100 px-6 pb-5 pt-0">
               {asking && askingConvId === activeConversation?.id ? <div className="mx-auto mb-3 flex max-w-4xl items-center justify-between rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700"><span>正在生成回答…</span><button type="button" onClick={stopGeneration} className="rounded-md bg-white px-2 py-1 font-medium">停止</button></div> : null}
               {!editingActive ? <form onSubmit={ask} className="mx-auto max-w-4xl rounded-2xl border border-base-300 bg-base-100 p-3 shadow-lg shadow-black/5 focus-within:border-primary/40">
                 <textarea disabled={inputDisabled} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit() } }} rows={2} className="w-full resize-none bg-transparent px-1 text-sm leading-6 outline-none disabled:cursor-not-allowed" placeholder={inputPlaceholder} />
-                <div className="mt-2 flex items-center justify-between"><button type="button" disabled={inputDisabled} className="rounded-lg bg-base-200 px-3 py-1.5 text-xs text-base-content/60 disabled:opacity-40">快速回答⌄</button><div className="flex items-center gap-1"><button type="button" disabled={inputDisabled} className="rounded-lg p-2 text-base-content/45 hover:bg-base-200 disabled:opacity-30" title="添加附件"><Icon><path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7L9.7 17.7a2 2 0 0 1-2.8-2.8l8.9-8.9" /></Icon></button><button type="submit" disabled={inputDisabled || !question.trim()} className="flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-content transition disabled:bg-base-300 disabled:text-base-content/30" aria-label="发送"><Icon><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></Icon></button></div></div>
+                <div className="mt-2 flex items-center justify-between"><div className="flex items-center gap-3"><button type="button" disabled={inputDisabled} className="rounded-lg bg-base-200 px-3 py-1.5 text-xs text-base-content/60 disabled:opacity-40">快速回答⌄</button><label className={`flex items-center gap-1.5 text-xs text-base-content/60 ${inputDisabled ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'}`} title="开启后结合互联网搜索结果作答并附上来源；需后端配置搜索服务"><input type="checkbox" className="toggle toggle-primary toggle-xs" checked={webSearch} disabled={inputDisabled || asking} onChange={(event) => setWebSearch(event.target.checked)} /><span>联网搜索</span></label></div><div className="flex items-center gap-1"><button type="button" disabled={inputDisabled} className="rounded-lg p-2 text-base-content/45 hover:bg-base-200 disabled:opacity-30" title="添加附件"><Icon><path d="m21.4 11.6-8.9 8.9a6 6 0 0 0-8.5-8.5l9.6-9.6a4 4 0 0 1 5.7 5.7L9.7 17.7a2 2 0 0 1-2.8-2.8l8.9-8.9" /></Icon></button><button type="submit" disabled={inputDisabled || !question.trim()} className="flex h-9 w-9 items-center justify-center rounded-full bg-primary text-primary-content transition disabled:bg-base-300 disabled:text-base-content/30" aria-label="发送"><Icon><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></Icon></button></div></div>
               </form> : null}
             </div>
           </div>
@@ -2461,7 +3160,7 @@ export default function Knowledge() {
 
       {editingLibraryId != null && <Dialog width="md" onClose={() => setEditingLibraryId(null)}>
         <DialogHeader title="修改资料" icon={menuIcons.edit} onClose={() => setEditingLibraryId(null)} />
-        <DialogField label="名称" required>
+        <DialogField label={newContentType === 'doc' ? '名称（自动使用 .docx 格式）' : newContentType === 'text' ? '名称（自动使用 .txt 格式）' : newContentType === 'sheet' ? '名称（自动使用 .xlsx 格式）' : '名称'} required>
           <AutofocusInput value={editingLibraryName} onChange={(event) => setEditingLibraryName(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && saveLibraryProfile(editingLibraryId)} className="input input-bordered mt-1.5 w-full" placeholder="请输入知识库名称" />
         </DialogField>
         <CoverPicker value={editingLibraryCover} onChange={setEditingLibraryCover} />
@@ -2489,12 +3188,53 @@ export default function Knowledge() {
       {creatingLibrary && <Dialog width="md" onClose={() => setCreatingLibrary(false)}>
         <DialogHeader title="新建知识库" icon={menuIcons.folderPlus} onClose={() => setCreatingLibrary(false)} />
         <DialogField label="名称" required>
-          <AutofocusInput value={newLibraryName} onChange={(event) => setNewLibraryName(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && createLibrary()} className="input input-bordered mt-1.5 w-full" placeholder="请输入知识库名称" />
+          <AutofocusInput value={newLibraryName} onChange={(event) => setNewLibraryName(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void createLibrary()} className="input input-bordered mt-1.5 w-full" placeholder="请输入知识库名称" />
         </DialogField>
         <CoverPicker value={newLibraryCover} onChange={setNewLibraryCover} />
+        <div className="mt-4">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium text-base-content/80">共享对象（可选）</span>
+            {/* 勾选集跨层级保留（换层级不会清空已选的），所以要有个总数，否则在别的层级勾的人就"看不见"了。 */}
+            <span className="text-xs text-base-content/45">已勾选 {createSharePicked.size} 人</span>
+          </div>
+          <p className="mt-1 text-xs leading-5 text-base-content/45">创建后立即共享指定用户，共享对象只读，可随时撤销。</p>
+          {/* 与「共享管理」同一套组织架构层级下拉（选项构造、未分配口径、层级过滤都走模块级 helper）。 */}
+          {(() => {
+            const levelOptions = buildLevelOptions(createShareOrgNodes, createShareCandidates.some((user) => isUnassignedUser(user, createShareOrgNodes)))
+            const visible = usersInLevel(createShareCandidates, createShareOrgNodes, createShareLevelId)
+            const levelPath = levelLabel(createShareOrgNodes, createShareLevelId)
+            return <>
+              <select
+                value={createShareLevelId ?? ''}
+                onChange={(event) => setCreateShareLevelId(event.target.value ? Number(event.target.value) : null)}
+                className="select select-bordered select-sm mt-3 w-full"
+              >
+                <option value="">请选择层级</option>
+                {levelOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+              {createShareLevelId != null && (
+                <p className="mt-1.5 text-xs text-base-content/45">
+                  {levelPath} · {visible.length} 人
+                  {!visible.length && '（该层级下暂无用户）'}
+                </p>
+              )}
+              <div className="mt-1.5 max-h-40 space-y-0.5 overflow-y-auto rounded-lg border border-base-200 p-1.5">
+                {visible.length ? visible.map((user) => {
+                  const picked = createSharePicked.has(user.id)
+                  return <label key={user.id} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-base-200/70">
+                    <input type="checkbox" checked={picked} onChange={() => setCreateSharePicked((current) => { const next = new Set(current); if (next.has(user.id)) next.delete(user.id); else next.add(user.id); return next })} className="checkbox checkbox-sm" />
+                    <span className="truncate">{user.nickname}</span>
+                    {user.nickname !== user.username && <span className="truncate text-xs text-base-content/40">@{user.username}</span>}
+                  </label>
+                }) : <p className="px-1.5 py-2 text-xs text-base-content/35">{createShareLevelId == null ? '请先选择层级' : (createShareCandidates.length ? '该层级下暂无用户' : '暂无可共享的用户')}</p>}
+              </div>
+            </>
+          })()}
+        </div>
+        <DialogError>{createShareError}</DialogError>
         <DialogActions>
           <button onClick={() => setCreatingLibrary(false)} className="btn btn-ghost">取消</button>
-          <button onClick={createLibrary} disabled={!newLibraryName.trim()} className="btn btn-primary">创建</button>
+          <button onClick={() => void createLibrary()} disabled={!newLibraryName.trim() || createShareBusy} className="btn btn-primary">{createShareBusy ? '创建中…' : '创建'}</button>
         </DialogActions>
       </Dialog>}
 
@@ -2658,6 +3398,98 @@ export default function Knowledge() {
           </DialogActions>
         </Dialog>
       })()}
+      {shareDialogLibraryId != null && (() => {
+        const library = libraries.find((item) => item.id === shareDialogLibraryId)
+        if (!library) return null
+        const entries = outgoingByLibrary.get(shareDialogLibraryId) || []
+        const everyoneEntry = entries.find((entry) => entry.granteeType === 'everyone')
+        const userEntries = entries.filter((entry) => entry.granteeType === 'user')
+        // 已点名授权的用户从候选列表里置灰勾死：他们要撤就走下方清单的「撤销」，
+        // 不在勾选框里做反选 —— 勾选框承载“新增”、按钮承载“撤销”，两个动作各走各的接口，
+        // 不会出现“取消勾选=提交删除集合”那种 diff 歧义。
+        const alreadySharedIds = new Set(userEntries.map((entry) => entry.granteeUserId))
+        const newPickedCount = [...sharePicked].filter((id) => !alreadySharedIds.has(id)).length
+
+        // —— 组织架构层级下拉 ——
+        // 一档下拉铺开**所有**层级（按树的先序、缩进表示深度），不必逐级下钻。
+        const levelOptions = buildLevelOptions(shareOrgNodes, shareCandidates.some((user) => isUnassignedUser(user, shareOrgNodes)))
+        const visibleCandidates = usersInLevel(shareCandidates, shareOrgNodes, shareLevelId)
+        const levelPath = levelLabel(shareOrgNodes, shareLevelId)
+
+        return <Dialog onClose={() => setShareDialogLibraryId(null)}>
+          <DialogHeader title="共享管理" icon={menuIcons.link} subtitle={`“${library.name}” · 共享对象只读，可随时撤销`} onClose={() => setShareDialogLibraryId(null)} />
+          <div className="mt-3 space-y-2">
+            {/* 「所有人可见」已不再提供开启入口（新建弹窗里的勾选框也一并去掉）。
+                存量已开启的库仍在这里显示并可撤销 —— 否则那些授权就再也撤不掉了。 */}
+            {everyoneEntry && (
+              <div className="flex items-center gap-2 text-sm">
+                <span className="font-medium">所有人可见（只读） · 已开启</span>
+                <button onClick={() => void revokeShareEntry(everyoneEntry)} disabled={shareBusy} className="btn btn-ghost btn-xs text-error">撤销</button>
+              </div>
+            )}
+            <div className="rounded-lg border border-base-200 p-2">
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="text-sm">指定用户可见（只读）</span>
+                <span className="text-xs text-base-content/45">已勾选 {newPickedCount} 人</span>
+              </div>
+              {/* 组织架构层级下拉：一档铺开全部层级（缩进即深度），下方列出该层级的用户供勾选。 */}
+              <div className="mb-1.5 space-y-1.5">
+                <select
+                  value={shareLevelId ?? ''}
+                  onChange={(event) => setShareLevelId(event.target.value ? Number(event.target.value) : null)}
+                  className="select select-bordered select-sm w-full"
+                >
+                  <option value="">请选择层级</option>
+                  {levelOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
+                {shareLevelId != null && (
+                  <p className="text-xs text-base-content/45">
+                    {levelPath} · {visibleCandidates.length} 人
+                    {!visibleCandidates.length && '（该层级下暂无用户）'}
+                  </p>
+                )}
+              </div>
+              <div className="max-h-44 space-y-0.5 overflow-y-auto">
+                {visibleCandidates.map((user) => {
+                  const shared = alreadySharedIds.has(user.id)
+                  const picked = sharePicked.has(user.id)
+                  return <label key={user.id} className={`flex items-center gap-2 rounded px-1.5 py-1 text-sm ${shared ? 'opacity-45' : 'cursor-pointer hover:bg-base-200/70'}`}>
+                    <input
+                      type="checkbox"
+                      className="checkbox checkbox-sm"
+                      checked={shared || picked}
+                      disabled={shared}
+                      onChange={() => setSharePicked((current) => {
+                        const next = new Set(current)
+                        if (next.has(user.id)) next.delete(user.id); else next.add(user.id)
+                        return next
+                      })}
+                    />
+                    <span className="truncate">{user.nickname}</span>
+                    {user.nickname !== user.username && <span className="truncate text-xs text-base-content/40">@{user.username}</span>}
+                    {shared && <span className="ml-auto shrink-0 rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-700">已共享</span>}
+                  </label>
+                })}
+                {!visibleCandidates.length && <p className="px-1.5 py-2 text-xs text-base-content/35">{shareLevelId == null ? '请先选择层级' : (shareCandidates.length ? '该层级下暂无用户' : '暂无可共享的用户')}</p>}
+              </div>
+              {userEntries.length > 0 && <div className="mt-1.5 border-t border-base-200 pt-1.5">
+                <p className="mb-1 text-xs text-base-content/45">已授权 {userEntries.length} 人（撤销即时生效）</p>
+                <div className="max-h-28 space-y-0.5 overflow-y-auto">
+                  {userEntries.map((entry) => <div key={entry.shareId} className="flex items-center gap-2 px-1.5 py-0.5 text-sm">
+                    <span className="truncate">{entry.granteeName || `用户${entry.granteeUserId}`}</span>
+                    <button onClick={() => void revokeShareEntry(entry)} disabled={shareBusy} className="ml-auto btn btn-ghost btn-xs text-error">撤销</button>
+                  </div>)}
+                </div>
+              </div>}
+            </div>
+          </div>
+          <DialogError>{shareError}</DialogError>
+          <DialogActions>
+            <button onClick={() => setShareDialogLibraryId(null)} className="btn btn-ghost">关闭</button>
+            <button onClick={() => void saveShareDialog()} disabled={shareBusy || !newPickedCount} className="btn btn-primary">{shareBusy ? '保存中…' : `共享给所选${newPickedCount ? `（${newPickedCount} 人）` : ''}`}</button>
+          </DialogActions>
+        </Dialog>
+      })()}
       {addingContentLibraryId != null && <Dialog onClose={closeAddContent}>
         <DialogHeader
           title="添加内容"
@@ -2675,12 +3507,12 @@ export default function Knowledge() {
           />
         </DialogField>
         <DialogField label="类型">
-          <select value={newContentType} onChange={(event) => setNewContentType(event.target.value as ContentItem['type'])} className="select select-bordered mt-1.5 w-full"><option value="folder">文件夹</option><option value="doc">Word 文档</option><option value="pdf">PDF 文档</option></select>
+          <select value={newContentType} onChange={(event) => setNewContentType(event.target.value as ContentItem['type'] | 'text' | 'sheet')} className="select select-bordered mt-1.5 w-full"><option value="folder">文件夹</option><option value="doc">Word 文档</option><option value="sheet">Excel 文档</option><option value="text">TXT 文本文件</option></select>
         </DialogField>
         <DialogError>{newContentError}</DialogError>
         <DialogActions>
-          <button onClick={closeAddContent} className="btn btn-ghost">取消</button>
-          <button onClick={addContent} disabled={!newContentName.trim()} className="btn btn-primary">添加</button>
+          <button onClick={closeAddContent} disabled={addingContentBusy} className="btn btn-ghost">取消</button>
+          <button onClick={() => void addContent()} disabled={!newContentName.trim() || addingContentBusy} className="btn btn-primary">{addingContentBusy ? '创建中…' : '添加'}</button>
         </DialogActions>
       </Dialog>}
     </div>

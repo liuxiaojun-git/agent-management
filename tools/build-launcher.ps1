@@ -1,11 +1,8 @@
 <#
-  由 StartFrontendBackend.cs 重新编译根目录的「启动前后端.exe」。
-
-  修改启动逻辑后执行：
-    powershell -ExecutionPolicy Bypass -File .\tools\build-launcher.ps1
-
-  使用 .NET Framework 自带的 csc.exe（Windows 内置，无需安装 .NET SDK）。
-  注意：编译参数必须用 - 前缀（如 -nologo），/ 前缀会被 MSYS/Git Bash 当作路径转换。
+  Rebuild the root launcher executable from StartFrontendBackend.cs.
+  Run this script after changing the launcher source.
+  Use .NET Framework's built-in csc.exe; no .NET SDK is required.
+  Compiler options use a - prefix because MSYS/Git Bash may rewrite / prefixes.
 #>
 [CmdletBinding()]
 param()
@@ -15,18 +12,26 @@ $ErrorActionPreference = 'Stop'
 $toolsDirectory = $PSScriptRoot
 $projectDirectory = Split-Path $toolsDirectory -Parent
 $sourceFile = Join-Path $toolsDirectory 'StartFrontendBackend.cs'
-$outputFile = Join-Path $projectDirectory '启动前后端.exe'
+$launcherName = [string]::Concat([char]0x542F, [char]0x52A8, [char]0x524D, [char]0x540E, [char]0x7AEF, '.exe')
+$outputFile = Join-Path $projectDirectory $launcherName
+$temporaryFile = Join-Path $projectDirectory ([string]::Concat([char]0x542F, [char]0x52A8, [char]0x524D, [char]0x540E, [char]0x7AEF, '.new.exe'))
 
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path $compiler)) {
   $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 }
 if (-not (Test-Path $compiler)) {
-  throw '未找到 .NET Framework 的 csc.exe，无法编译启动器。'
+  throw 'The .NET Framework csc.exe compiler was not found.'
 }
 
-Write-Host "编译 $outputFile" -ForegroundColor Cyan
-& $compiler -nologo -target:exe -codepage:65001 -utf8output "-out:$outputFile" $sourceFile
-if ($LASTEXITCODE -ne 0) { throw '启动器编译失败。' }
+Write-Host "Compiling $outputFile" -ForegroundColor Cyan
+try {
+  & $compiler -nologo -target:exe -codepage:65001 -utf8output "-out:$temporaryFile" $sourceFile
+  if ($LASTEXITCODE -ne 0) { throw 'Launcher compilation failed.' }
+  Move-Item -LiteralPath $temporaryFile -Destination $outputFile -Force
+}
+finally {
+  if (Test-Path $temporaryFile) { Remove-Item -LiteralPath $temporaryFile }
+}
 
-Write-Host '编译完成。' -ForegroundColor Green
+Write-Host 'Compilation complete.' -ForegroundColor Green

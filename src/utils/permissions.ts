@@ -1,4 +1,4 @@
-export type ModulePermission = 'home' | 'knowledge' | 'api_test' | 'logs' | 'models' | 'users'
+export type ModulePermission = 'home' | 'knowledge' | 'api_test' | 'logs' | 'models' | 'users' | 'ai'
 
 export const modulePaths: Record<ModulePermission, string> = {
   home: '/home',
@@ -7,6 +7,7 @@ export const modulePaths: Record<ModulePermission, string> = {
   logs: '/logs',
   models: '/models',
   users: '/users',
+  ai: '/ai-chat',
 }
 
 export function firstAllowedPath(permissions?: ModulePermission[]) {

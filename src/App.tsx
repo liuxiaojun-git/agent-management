@@ -11,6 +11,7 @@ const Models = lazy(() => import('./pages/Models'))
 const Knowledge = lazy(() => import('./pages/Knowledge'))
 const KnowledgeDocument = lazy(() => import('./pages/Knowledge').then((module) => ({ default: module.KnowledgeDocument })))
 const AiChatPage = lazy(() => import('./pages/AiChatPage'))
+const TasksPage = lazy(() => import('./pages/TasksPage'))
 const LoginPage = lazy(() => import('./pages/LoginPage'))
 const Users = lazy(() => import('./pages/Users'))
 
@@ -59,7 +60,11 @@ export default function App() {
             />
             <Route
               path="ai-chat"
-              element={<ProtectedRoute module="knowledge"><AiChatPage /></ProtectedRoute>}
+              element={<ProtectedRoute module="ai"><AiChatPage /></ProtectedRoute>}
+            />
+            <Route
+              path="tasks"
+              element={<ProtectedRoute module="ai"><TasksPage /></ProtectedRoute>}
             />
             <Route
               path="knowledge"

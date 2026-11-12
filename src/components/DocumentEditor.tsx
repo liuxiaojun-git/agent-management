@@ -6,13 +6,15 @@ import { html } from '@codemirror/lang-html'
 import { xml } from '@codemirror/lang-xml'
 import * as XLSX from 'xlsx'
 import { createMarkdownPreviewHtml, type ExcelSheet } from '../utils/documentRenderer'
+import type { DocxParagraphDraft } from '../utils/docxEditor'
 import { markdownTypographyClassName } from './DocumentRenderer'
 
 // 草稿形态。Word 与 Markdown 都用 markdown 字段，走同一套编辑面和预览。
 export type EditDraft =
   | { kind: 'text'; text: string }
   | { kind: 'sheet'; sheets: ExcelSheet[]; activeSheet: number }
-  | { kind: 'word'; markdown: string }
+  | { kind: 'word'; format: 'legacy'; markdown: string }
+  | { kind: 'word'; format: 'docx'; sourceBytes: Uint8Array; paragraphs: DocxParagraphDraft[] }
 
 export type EditableKind = 'word' | 'markdown' | 'text' | 'sheet'
 
@@ -24,8 +26,18 @@ export type DraftUpdater = (current: EditDraft) => EditDraft
 // 这些损失在解析阶段就注定了（parseExcelFile 只取 cell.w ?? cell.v，从不读 cell.f），
 // 用户看不到，所以必须在编辑态显式告知。
 const LOSS_NOTICE: Partial<Record<EditableKind, string>> = {
-  word: '保存后以下内容会丢失：图片、页眉页脚、分栏、文本框、批注、精确字体与颜色。',
   sheet: '保存后公式与单元格样式会丢失 —— 解析时只保留了每个单元格的显示值。',
+}
+
+const wordParagraphClasses: Record<DocxParagraphDraft['style'], string> = {
+  title: 'text-2xl font-semibold',
+  heading1: 'text-xl font-semibold',
+  heading2: 'text-lg font-semibold',
+  heading3: 'text-base font-semibold',
+  heading4: 'text-sm font-semibold',
+  heading5: 'text-sm font-medium',
+  heading6: 'text-sm font-medium text-base-content/70',
+  normal: 'text-sm',
 }
 
 const editorChromeTheme = EditorView.theme({
@@ -252,14 +264,36 @@ export function DocumentEditor({ kind, itemName, draft, onChange }: {
   onChange: (updater: DraftUpdater) => void
 }) {
   const notice = LOSS_NOTICE[kind]
+  const formatNotice = kind === 'word' && /\.doc$/i.test(itemName)
+    ? '旧版 .doc 不支持原格式回写；保存时将转换为 .docx，并同步修改知识库中的文件名。'
+    : null
 
   const body = (() => {
     if (draft.kind === 'sheet') return <SheetEditor draft={draft} onChange={onChange} />
 
     if (draft.kind === 'word') {
-      // Word 与 Markdown 共用一个编辑面：左改右看。
+      if (draft.format === 'docx') {
+        return <div className="min-h-0 flex-1 overflow-auto bg-base-100 px-8 py-6">
+          <div className="mx-auto max-w-205 space-y-3">
+            {draft.paragraphs.map((paragraph, index) => <textarea
+              key={index}
+              aria-label={`第 ${index + 1} 段`}
+              value={paragraph.text}
+              rows={Math.min(8, Math.max(1, Math.ceil(paragraph.text.length / 90)))}
+              onChange={(event) => {
+                const text = event.target.value.replace(/[\r\n]+/g, ' ')
+                onChange((current) => current.kind === 'word' && current.format === 'docx'
+                  ? { ...current, paragraphs: current.paragraphs.map((entry, entryIndex) => entryIndex === index ? { ...entry, text } : entry) }
+                  : current)
+              }}
+              className={`block w-full resize-y rounded-md border border-transparent bg-transparent px-3 py-1.5 leading-7 text-base-content outline-none transition focus:border-primary/40 focus:bg-primary/5 ${wordParagraphClasses[paragraph.style]} ${paragraph.inTable ? 'border-l-2 border-base-300' : ''}`}
+            />)}
+          </div>
+        </div>
+      }
+
       return <div className="flex min-h-0 flex-1">
-        <div className="flex min-w-0 flex-1 flex-col border-r border-base-300"><TextEditor value={draft.markdown} name={itemName} onChange={(markdown) => onChange(() => ({ kind: 'word', markdown }))} fill /></div>
+        <div className="flex min-w-0 flex-1 flex-col border-r border-base-300"><TextEditor value={draft.markdown} name={itemName} onChange={(markdown) => onChange(() => ({ kind: 'word', format: 'legacy', markdown }))} fill /></div>
         <div className="min-w-0 flex-1 overflow-auto bg-base-100"><MarkdownPreview markdown={draft.markdown} /></div>
       </div>
     }
@@ -274,6 +308,8 @@ export function DocumentEditor({ kind, itemName, draft, onChange }: {
   })()
 
   return <div className="flex min-h-0 flex-1 flex-col">
+    {formatNotice ? <p className="shrink-0 border-b border-blue-200 bg-blue-50 px-4 py-2 text-[11px] leading-5 text-blue-700">{formatNotice}</p> : null}
+    {draft.kind === 'word' && draft.format === 'docx' ? <p className="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-2 text-[11px] leading-5 text-amber-700">仅编辑原文档现有段落文字；保存会保留原 DOCX 的图片、页眉页脚、表格结构和版式。不支持新增/删除段落或修改格式。</p> : null}
     {notice ? <p className="shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-2 text-[11px] leading-5 text-amber-700">{notice}</p> : null}
     {body}
   </div>

@@ -4,6 +4,7 @@
 import type { ReactNode } from 'react'
 
 type RenderAssistantList = { kind: 'ol' | 'ul'; items: Array<{ text: string; depth: number }> } | null
+type RenderAssistantTable = { headers: string[]; rows: string[][] } | null
 
 const paragraphClass = 'wrap-anywhere whitespace-pre-wrap text-sm leading-7'
 
@@ -25,6 +26,7 @@ export function renderAssistantBlocks(text: string, options: { stripRefNumbers?:
   const blocks: ReactNode[] = []
   let paragraph: string[] = []
   let list: RenderAssistantList = null
+  let table: RenderAssistantTable = null
 
   const flushParagraph = () => {
     // 段内用空格连接、连续流动，只在到达气泡右边距时才折行；空行分隔的才是独立段落
@@ -41,13 +43,57 @@ export function renderAssistantBlocks(text: string, options: { stripRefNumbers?:
     list = null
   }
 
+  const flushTable = () => {
+    if (!table || !table.headers.length || !table.rows.length) { table = null; return }
+    blocks.push(
+      <div key={`table-${blocks.length}`} className="overflow-x-auto my-1">
+        <table className="w-full border-collapse text-sm leading-6">
+          <thead>
+            <tr className="border-b border-base-300/60">
+              {table.headers.map((header, index) => (
+                <th key={index} className="text-left text-base-content/70 px-2 py-1.5 font-medium">{renderAssistantInline(header)}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {table.rows.map((row, rowIndex) => (
+              <tr key={rowIndex} className="border-b border-base-200/40">
+                {row.map((cell, cellIndex) => (
+                  <td key={cellIndex} className="text-base-content px-2 py-1.5 wrap-anywhere whitespace-pre-wrap">{renderAssistantInline(cell)}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+    table = null
+  }
+
   const clean = (value: string) => (stripRefNumbers ? value.replace(/\[(\d+)\]/g, '') : value).trim()
 
   lines.forEach((line) => {
     const trimmed = line.trim()
-    // 空行只冲刷段落、不冲刷列表：模型常把列表写成「项之间空一行」的松散列表（loose list），
+    // 空行只冲刷段落和表格、不冲刷列表：模型常把列表写成「项之间空一行」的松散列表（loose list），
     // 若空行就 flushList，每个 1. 2. 3. 会各自成一个 <ol>，全部从头显示成 1。
-    if (!trimmed) { flushParagraph(); return }
+    // 表格则不同——Markdown 表格是连续行，空行代表表格结束，需在此收尾，避免两张表粘连。
+    if (!trimmed) { flushParagraph(); flushTable(); return }
+    // Markdown 表格行：以 | 包围，如 | 时间段 | 周一 | 或 |---|---|
+    if (/^\s*\|(.+)\|\s*$/.test(trimmed)) {
+      flushParagraph()
+      flushList()
+      // 分隔行：|---|---| 或 |:---|:---:|---:|
+      if (/^\s*\|(\s*:?-{3,}:?\s*\|)+\s*$/.test(trimmed)) return
+      const cells = trimmed
+        .replace(/^\s*\||\s*\|$/g, '')
+        .split('|')
+        .map((cell) => cell.trim())
+      if (!table) { table = { headers: cells, rows: [] } }
+      else { table.rows.push(cells) }
+      return
+    }
+    // 遇到非表格行，若此前正在收集表格，先把表格渲染出来
+    if (table) flushTable()
     // 一级/二级/三级标题（Markdown # / ## / ###），飞书文档式排版
     const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/)
     if (headingMatch) {
@@ -56,8 +102,13 @@ export function renderAssistantBlocks(text: string, options: { stripRefNumbers?:
       const level = headingMatch[1].length
       const headingText = clean(headingMatch[2].replace(/\*\*/g, ''))
       const headingClass = level === 1 ? 'text-[17px] font-bold leading-8' : level === 2 ? 'text-[15px] font-bold leading-7' : 'text-sm font-semibold leading-7'
-      const headingProps = { key: `h-${blocks.length}`, className: `${headingClass} pt-1 text-base-content` }
-      blocks.push(level === 1 ? <h1 {...headingProps}>{headingText}</h1> : level === 2 ? <h2 {...headingProps}>{headingText}</h2> : <h3 {...headingProps}>{headingText}</h3>)
+      const headingKey = `h-${blocks.length}`
+      const headingClassName = `${headingClass} pt-1 text-base-content`
+      blocks.push(level === 1
+        ? <h1 key={headingKey} className={headingClassName}>{headingText}</h1>
+        : level === 2
+          ? <h2 key={headingKey} className={headingClassName}>{headingText}</h2>
+          : <h3 key={headingKey} className={headingClassName}>{headingText}</h3>)
       return
     }
     const orderedMatch = trimmed.match(/^(\d+)([.、)：)])(.*)$/)
@@ -89,6 +140,7 @@ export function renderAssistantBlocks(text: string, options: { stripRefNumbers?:
 
   flushParagraph()
   flushList()
+  flushTable()
 
   if (!blocks.length) return <p className={paragraphClass}>{text}</p>
   return <div className="space-y-3">{blocks}</div>

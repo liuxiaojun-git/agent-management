@@ -46,6 +46,55 @@ export type ChatModel = {
   enabled: boolean
 }
 
+export type PersonalPromptTemplate = {
+  id: number
+  title: string
+  category: string
+  description: string
+  content: string
+  favorite: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export type PersonalPromptTemplateInput = Omit<PersonalPromptTemplate, 'id' | 'createdAt' | 'updatedAt'>
+
+export type TaskStatus = 'pending' | 'in_progress' | 'paused' | 'completed'
+export type TaskPriority = 'low' | 'normal' | 'high'
+
+export type PersonalTask = {
+  id: number
+  assignedUserId: number | null
+  assignedUserName: string | null
+  isAssignedToMe: boolean
+  projectId: number | null
+  title: string
+  description: string
+  status: TaskStatus
+  priority: TaskPriority
+  dueDate: string | null
+  sourceConversationId: string | null
+  sourceMessageId: string | null
+  images: TaskImage[]
+  createdAt: string
+  updatedAt: string
+}
+
+export type TaskImage = {
+  id: string
+  filename: string
+  type: string
+  size: number
+}
+
+export type PersonalTaskInput = Pick<PersonalTask, 'title' | 'description' | 'priority' | 'dueDate'> & {
+  projectId?: number | null
+  assignedUserId?: number | null
+  imageIds?: string[]
+}
+export type TaskAssignee = { id: number; username: string; nickname: string | null; name: string }
+export type TaskProject = { id: number; name: string; taskCount: number; createdAt: string; updatedAt: string }
+
 export const CHAT_SESSIONS_KEY = 'zhiyu-chat-sessions-v1'
 export const CHAT_MODEL_KEY = 'zhiyu-chat-model-v1'
 let modelsRequest: Promise<ChatModel[]> | null = null
@@ -166,11 +215,36 @@ export async function getBackendConversations(): Promise<ChatConversation[]> {
   }
 }
 
-export async function getBackendMessages(conversationId: string): Promise<ChatMessage[]> {
-  // v1 消息是分页的 pagedResult（.items），且**不含 usage/tokens**（§5.3 精简了字段），
-  // 所以这里不再拼 usage，调用方对 undefined usage 本就做了「不显示」的处理。
-  const result = await readBackend<{ items: Array<{ id: string; role: ChatRole; content: string; model?: string | null; status?: ChatMessage['status']; createdAt: string }> }>(`/conversations/${encodeURIComponent(conversationId)}/messages?page=1&pageSize=1000`)
-  return result.items.map((message) => ({
+export async function getBackendConversation(conversationId: string): Promise<ChatConversation> {
+  const result = await readBackend<{ conversation: { id: string; title: string; updatedAt: string } }>(
+    `/conversations/${encodeURIComponent(conversationId)}`,
+  )
+  return {
+    id: result.conversation.id,
+    backendId: result.conversation.id,
+    title: result.conversation.title,
+    updatedAt: result.conversation.updatedAt,
+    messages: [],
+  }
+}
+
+export async function getBackendMessages(conversationId: string, targetMessageId?: string): Promise<ChatMessage[]> {
+  // v1 消息按倒序分页，单页最多 100 条；深链需要翻页直到定位到目标消息。
+  const pageSize = 100
+  const pages: Array<Array<{ id: string; role: ChatRole; content: string; model?: string | null; status?: ChatMessage['status']; createdAt: string }>> = []
+  let totalPages = 1
+  for (let page = 1; page <= totalPages; page += 1) {
+    const result = await readBackend<{
+      items: Array<{ id: string; role: ChatRole; content: string; model?: string | null; status?: ChatMessage['status']; createdAt: string }>
+      totalPages: number
+    }>(`/conversations/${encodeURIComponent(conversationId)}/messages?page=${page}&pageSize=${pageSize}`)
+    pages.push(result.items)
+    totalPages = result.totalPages
+    if (targetMessageId && result.items.some((message) => message.id === targetMessageId)) break
+  }
+  const messages = (targetMessageId ? pages.reverse().flat() : pages[0] || [])
+  // v1 响应不含 usage/tokens，正文和任务溯源所需的消息字段保持足够。
+  return messages.map((message) => ({
     id: message.id,
     role: message.role,
     content: message.content,
@@ -187,6 +261,182 @@ export async function createBackendConversation(title: string, model: string): P
     body: JSON.stringify({ title, model }),
   })
   return result.conversation.id
+}
+
+export async function getBackendPromptTemplates(): Promise<PersonalPromptTemplate[]> {
+  return readBackend<PersonalPromptTemplate[]>('/conversations/prompt-templates')
+}
+
+export async function createBackendPromptTemplate(template: PersonalPromptTemplateInput): Promise<PersonalPromptTemplate> {
+  const result = await readBackend<{ template: PersonalPromptTemplate }>('/conversations/prompt-templates', {
+    method: 'POST',
+    body: JSON.stringify(template),
+  })
+  return result.template
+}
+
+export async function updateBackendPromptTemplate(id: number, template: PersonalPromptTemplateInput): Promise<PersonalPromptTemplate> {
+  const result = await readBackend<{ template: PersonalPromptTemplate }>(`/conversations/prompt-templates/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(template),
+  })
+  return result.template
+}
+
+export async function deleteBackendPromptTemplate(id: number): Promise<void> {
+  await readBackend<null>(`/conversations/prompt-templates/${id}`, { method: 'DELETE' })
+}
+
+export type TaskDueFilter = 'overdue' | 'today' | 'upcoming'
+export type TaskSort = 'default' | 'priority' | 'due_date'
+export type TaskSummary = {
+  totalTasks: number
+  pending: number
+  inProgress: number
+  paused: number
+  completed: number
+  overdue: number
+  dueToday: number
+  dueNext7Days: number
+}
+
+export async function getBackendTasks(options: {
+  page?: number
+  pageSize?: number
+  projectId?: number | 'all' | 'unassigned' | 'assigned'
+  status?: TaskStatus | ''
+  keyword?: string
+  due?: TaskDueFilter | ''
+  sort?: TaskSort
+} = {}) {
+  const query = new URLSearchParams({
+    page: String(options.page || 1),
+    pageSize: String(options.pageSize || 20),
+    sort: options.sort || 'default',
+  })
+  if (options.projectId !== undefined && options.projectId !== 'all') query.set('projectId', String(options.projectId))
+  if (options.status) query.set('status', options.status)
+  if (options.keyword?.trim()) query.set('keyword', options.keyword.trim())
+  if (options.due) query.set('due', options.due)
+  return readBackend<{
+    items: PersonalTask[]
+    page: number
+    pageSize: number
+    total: number
+    totalPages: number
+    summary: TaskSummary
+  }>(`/tasks?${query}`)
+}
+
+export async function getBackendTaskProjects(): Promise<{ projects: TaskProject[]; unassignedCount: number; assignedCount: number }> {
+  return readBackend<{ projects: TaskProject[]; unassignedCount: number; assignedCount: number }>('/tasks/projects')
+}
+
+export async function getBackendTaskAssignees(): Promise<TaskAssignee[]> {
+  const result = await readBackend<{ items: TaskAssignee[] }>('/tasks/assignees')
+  return result.items
+}
+
+export async function createBackendTaskProject(name: string): Promise<TaskProject> {
+  const result = await readBackend<{ project: TaskProject }>('/tasks/projects', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  })
+  return result.project
+}
+
+export async function reorderBackendTaskProjects(ids: number[]): Promise<void> {
+  await readBackend<null>('/tasks/projects/order', {
+    method: 'PUT',
+    body: JSON.stringify({ ids }),
+  })
+}
+
+export async function updateBackendTaskProject(id: number, name: string): Promise<TaskProject> {
+  const result = await readBackend<{ project: TaskProject }>(`/tasks/projects/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ name }),
+  })
+  return result.project
+}
+
+export async function deleteBackendTaskProject(id: number): Promise<void> {
+  await readBackend<null>(`/tasks/projects/${id}`, { method: 'DELETE' })
+}
+
+export async function createBackendTasks(
+  tasks: PersonalTaskInput[],
+  source: { conversationId: string | null; messageId: string | null } = { conversationId: null, messageId: null },
+  projectId: number | null = null,
+): Promise<{ items: PersonalTask[]; skipped: number }> {
+  const result = await readBackend<{ items: PersonalTask[]; skipped: number }>('/tasks', {
+    method: 'POST',
+    body: JSON.stringify({
+      tasks,
+      sourceConversationId: source.conversationId,
+      sourceMessageId: source.messageId,
+      projectId,
+    }),
+  })
+  return result
+}
+
+export async function updateBackendTask(id: number, task: PersonalTaskInput & { status: TaskStatus }): Promise<PersonalTask> {
+  const result = await readBackend<{ task: PersonalTask }>(`/tasks/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(task),
+  })
+  return result.task
+}
+
+export async function deleteBackendTask(id: number): Promise<void> {
+  await readBackend<null>(`/tasks/${id}`, { method: 'DELETE' })
+}
+
+export async function uploadTaskImage(file: File): Promise<ChatFile> {
+  const allowedTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+  if (!allowedTypes.has(file.type)) throw new Error('图片仅支持 PNG、JPEG、WebP 或 GIF 格式')
+  if (file.size > 5 * 1024 * 1024) throw new Error('单张任务图片不能超过 5MB')
+  const form = new FormData()
+  form.append('file', file)
+  const response = await fetch(`${V1_BASE}/files`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: form,
+  })
+  const payload = await response.json().catch(() => ({})) as { code?: number | string; message?: string; data?: { id: string; filename: string; size: number; type: string } }
+  if (response.status === 401) handleUnauthorized()
+  if (!response.ok || payload.code !== 0 || !payload.data) throw new Error(payload.message || `图片上传失败（${response.status}）`)
+  return { id: payload.data.id, name: payload.data.filename, size: payload.data.size, type: payload.data.type }
+}
+
+export async function getTaskImageObjectUrl(id: string, signal: AbortSignal): Promise<string> {
+  const response = await fetch(`${V1_BASE}/files/${encodeURIComponent(id)}`, {
+    headers: authHeaders(),
+    signal,
+  })
+  if (response.status === 401) handleUnauthorized()
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { message?: string }
+    throw new Error(payload.message || `图片加载失败（${response.status}）`)
+  }
+  return URL.createObjectURL(await response.blob())
+}
+
+export async function updateBackendTaskStatuses(ids: number[], status: TaskStatus): Promise<number> {
+  const result = await readBackend<{ affectedCount: number }>('/tasks/bulk/status', {
+    method: 'PATCH',
+    body: JSON.stringify({ ids, status }),
+  })
+  return result.affectedCount
+}
+
+export async function deleteBackendTasks(ids: number[]): Promise<number> {
+  const result = await readBackend<{ affectedCount: number }>('/tasks/bulk', {
+    method: 'DELETE',
+    body: JSON.stringify({ ids }),
+  })
+  return result.affectedCount
 }
 
 export async function deleteBackendConversation(conversationId: string) {

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-// base URL 已收敛到 utils/apiBase.ts（原本此处有一份与另外 3 个文件逐字重复的定义）
-import { V1_BASE } from '../utils/apiBase'
+import { v1Fetch } from '../utils/api'
+
+import homeBannerImage from '../assets/首页header.png'
 
 type Range = 'today' | '7d' | '30d' | 'year' | 'all'
 interface DashboardData {
@@ -38,14 +39,20 @@ export default function Home() {
   const load = useCallback(async () => {
     setLoading(true); setError('')
     try {
-      const token = localStorage.getItem('access_token')
-      const response = await fetch(`${V1_BASE}/dashboard?range=${range}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+      const response = await v1Fetch(`/dashboard?range=${range}`)
       const payload = await response.json()
       if (!response.ok || payload.code !== 0) throw new Error(payload.message || '首页数据加载失败')
       setData(payload.data); setUpdatedAt(new Date())
     } catch (cause) { setError(cause instanceof Error ? cause.message : '首页数据加载失败') }
     finally { setLoading(false) }
   }, [range])
+  // 挂载与切换时间范围时加载首屏数据。
+  // 这里按 react-hooks/set-state-in-effect 的规则要求**不该**用 effect 取数，但本项目没有
+  // 数据层（无 react-query / loader / use()），effect 取数是既有架构里唯一可用的写法。
+  // 而 `load` 里的 setState 全部发生在 fetch 之后，不会在 effect 的同步阶段执行 —— 规则检测不到
+  // await 边界，只要从 effect 能追到 setState 就报，属误报。规则的替代表达（把 setState 挪进
+  // 处理器）只覆盖得了同步那一半，异步这半无法消除，所以在此显式豁免。
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- effect 取数 + await 之后 setState，本项目架构下的误报
   useEffect(() => { void load() }, [load])
 
   const enabledModels = data?.models.filter((model) => model.enabled) || []
@@ -57,11 +64,22 @@ export default function Home() {
     { label: '平均运行时间', value: `${data.summary.averageDuration.toFixed(2)}s`, note: '从请求开始到响应完成', type: 'speed' as const, color: 'text-sky-600', bg: 'bg-sky-500/10' },
   ] : []
 
-  return <div className="h-full overflow-y-auto bg-base-200/25"><div className="mx-auto w-full max-w-none space-y-[clamp(0.75rem,1.2vw,1.5rem)] p-[clamp(0.25rem,0.8vw,1rem)] pb-8">
-    <header className="flex flex-col gap-[clamp(0.75rem,1vw,1.25rem)] rounded-2xl border border-base-300/60 bg-base-100 px-[clamp(1rem,2vw,2rem)] py-[clamp(1rem,1.5vw,1.5rem)] shadow-sm lg:flex-row lg:items-center lg:justify-between">
-      <div><h1 className="text-2xl font-bold tracking-tight">首页</h1><p className="mt-1 text-sm text-base-content/45">集中查看平台调用质量、资源消耗和知识资产状态。</p></div>
-      <div className="flex min-w-0 flex-wrap items-center gap-2"><div className="flex max-w-full overflow-x-auto rounded-xl border border-base-300/70 bg-base-200/50 p-1">{ranges.map((item) => <button key={item.value} onClick={() => setRange(item.value)} className={`shrink-0 rounded-lg px-[clamp(0.55rem,1vw,0.85rem)] py-1.5 text-xs font-medium transition ${range === item.value ? 'bg-base-100 text-primary shadow-sm' : 'text-base-content/45 hover:text-base-content'}`}>{item.label}</button>)}</div><button onClick={() => void load()} className="btn btn-ghost btn-sm border border-base-300/70" disabled={loading} title="刷新数据"><svg className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6.1 9A7 7 0 0 1 18 6l2 6M18 15a7 7 0 0 1-11.9 3L4 12" /></svg></button></div>
-    </header>
+  return <div className="min-h-full md:absolute md:inset-0 md:overflow-y-auto bg-base-200/25">
+        <div className="sticky top-14 md:top-0 z-40 h-[clamp(9rem,20vw,12rem)] mb-[clamp(0.75rem,1.2vw,3rem)] overflow-hidden border-b border-base-300/60 bg-base-100 shadow-sm">
+      <img src={homeBannerImage} className="absolute inset-0 h-full w-full object-cover" alt="个人 AI 工作台横幅" />
+      <div className="absolute inset-0 bg-base-100/5" />
+      <header className="absolute inset-0 z-10 flex flex-col justify-center gap-[clamp(0.75rem,1vw,1.25rem)] px-[clamp(0.25rem,0.8vw,1rem)] py-[clamp(1rem,1.5vw,1.5rem)] lg:flex-row lg:items-center lg:justify-between">
+      <div className="min-w-0">
+        <div className="flex items-end gap-3">
+          <h1 className="text-[clamp(1.75rem,3vw,2.5rem)] font-bold leading-none tracking-tight text-base-content">智域</h1>
+          <span className="mb-0.5 text-[clamp(0.85rem,1.3vw,1.1rem)] font-medium text-base-content/60">Personal AI Workspace</span>
+        </div>
+        <p className="mt-2.5 text-[clamp(0.9rem,1.2vw,1.05rem)] text-base-content/55">让 AI 成为你的工作搭档</p>
+      </div>
+      <div className="flex min-w-0 flex-wrap items-center gap-2 lg:absolute lg:right-[clamp(0.25rem,0.8vw,1rem)] lg:top-1/3 lg:-translate-y-1/2"><div className="flex max-w-full overflow-x-auto rounded-xl border border-base-300/70 bg-base-200/50 p-1">{ranges.map((item) => <button key={item.value} onClick={() => setRange(item.value)} className={`shrink-0 rounded-lg px-[clamp(0.55rem,1vw,0.85rem)] py-1.5 text-xs font-medium transition ${range === item.value ? 'bg-base-100 text-primary shadow-sm' : 'text-base-content/45 hover:text-base-content'}`}>{item.label}</button>)}</div><button onClick={() => void load()} className="btn btn-ghost btn-sm border border-base-300/70" disabled={loading} title="刷新数据"><svg className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6.1 9A7 7 0 0 1 18 6l2 6M18 15a7 7 0 0 1-11.9 3L4 12" /></svg></button></div>
+      </header>
+    </div>
+    <div className="mx-auto w-full max-w-none space-y-[clamp(0.75rem,1.2vw,1.5rem)] px-[clamp(1rem,2vw,2rem)] pb-8">
     {error && <div role="alert" className="flex items-center justify-between rounded-xl border border-error/20 bg-error/8 px-4 py-3 text-sm text-error"><span>{error}</span><button onClick={() => void load()} className="font-medium underline">重新加载</button></div>}
     {loading && !data ? <div className="grid min-h-80 place-items-center rounded-2xl border border-base-300/60 bg-base-100"><span className="loading loading-spinner loading-lg text-primary" /></div> : data && <>
       <section className="grid gap-[clamp(0.75rem,1vw,1rem)] sm:grid-cols-2 lg:grid-cols-4">{cards.map((card) => <article key={card.label} className="rounded-2xl border border-base-300/60 bg-base-100 p-[clamp(1rem,1.4vw,1.5rem)] shadow-sm transition hover:-translate-y-0.5 hover:shadow-md"><div className="flex items-start justify-between"><p className="text-sm font-medium text-base-content/50">{card.label}</p><span className={`grid h-10 w-10 place-items-center rounded-xl ${card.bg} ${card.color}`}><MetricIcon type={card.type} /></span></div><p className="mt-4 text-[clamp(1.5rem,2.2vw,2.25rem)] font-bold tracking-tight">{card.value}</p><p className="mt-2 truncate text-xs text-base-content/40" title={card.note}>{card.note}</p></article>)}</section>
